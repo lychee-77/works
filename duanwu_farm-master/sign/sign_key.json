@@ -1,0 +1,13 @@
+{
+  "private_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgaivUXdyhhV3bex2b\n8KTTIX7VD/AZLd2mNyzXSULAe+6hRANCAAR0IbiT2wRBhy3XsNXMLwqBgmph4mTk\nyI6qxDmvRj51SNFuhsMW2iyv5po6E6H55gXh/ThExre6ITJtT8E+NFHr\n-----END PRIVATE KEY-----\n",
+  "public_jwk": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "dCG4k9sEQYct17DVzC8KgYJqYeJk5MiOqsQ5r0Y-dUg",
+    "y": "0W6GwxbaLK_mmjoTofnmBeH9OETGt7ohMm1PwT40Ues",
+    "key_ops": [
+      "verify"
+    ],
+    "ext": true
+  }
+}
