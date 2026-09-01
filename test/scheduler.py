@@ -34,6 +34,10 @@ DEFAULT_DEBUG_PORT = 9222
 DEFAULT_EDGE_USER_DATA_DIR = os.path.join(HERE, "edge-farm-profile")
 FARM_URL = "https://www.duanwuqiufenmao.top/farm"
 
+# 子进程下一轮启动间隔(秒) 由 auto_plant.py 通过 stdout 一行 NEXT_INTERVAL=NNN 告知
+# 没拿到就用这个默认值
+DEFAULT_NEXT_INTERVAL = 30 * 60  # 30 分钟
+
 # 常见 Edge 安装位置
 EDGE_PATHS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -50,12 +54,13 @@ def log(msg, lines):
 
 
 def run_script(name, lines, extra_args=None, env=None):
-    """运行 auto_xxx.py, 实时打印输出, 返回是否成功"""
+    """运行 auto_xxx.py, 实时打印输出, 返回 (success, captured_stdout)"""
     path = os.path.join(HERE, name)
     if not os.path.exists(path):
         log(f"[!] 找不到脚本: {path}", lines)
-        return False
+        return False, ""
     log(f"=== 开始执行 {name} ===", lines)
+    captured = []
     try:
         # 把当前调试端口/用户目录通过环境变量透传给子脚本
         child_env = os.environ.copy()
@@ -70,6 +75,7 @@ def run_script(name, lines, extra_args=None, env=None):
         )
         for stdout_line in iter(proc.stdout.readline, ""):
             if stdout_line:
+                captured.append(stdout_line)
                 ts = datetime.now().strftime("%H:%M:%S")
                 line = f"  [{ts}] {stdout_line.rstrip()}"
                 print(line, flush=True)
@@ -77,13 +83,23 @@ def run_script(name, lines, extra_args=None, env=None):
         proc.wait()
         if proc.returncode == 0:
             log(f"=== {name} 执行成功 ===", lines)
-            return True
+            return True, "".join(captured)
         else:
             log(f"=== {name} 执行失败 (exit={proc.returncode}) ===", lines)
-            return False
+            return False, "".join(captured)
     except Exception as e:
         log(f"[!] 执行 {name} 异常: {e}", lines)
-        return False
+        return False, "".join(captured)
+
+
+def parse_next_interval(captured_stdout: str) -> int:
+    """从子进程 stdout 找 'NEXT_INTERVAL=NNN', 找不到就用默认"""
+    import re
+    for line in captured_stdout.splitlines():
+        m = re.search(r"NEXT_INTERVAL\s*=\s*(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return DEFAULT_NEXT_INTERVAL
 
 
 def find_edge_exe():
@@ -145,7 +161,6 @@ def launch_edge(lines, port, user_data_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, default=1800, help="间隔秒数 (默认 1800=30分钟)")
     parser.add_argument("--harvest-only", action="store_true", help="只跑收菜")
     parser.add_argument("--plant-only", action="store_true", help="只跑种菜")
     parser.add_argument("--harvest-args", default="", help="透传给 auto_harvest.py 的额外参数")
@@ -170,11 +185,11 @@ def main():
 
     lines = []
     log(f"=== 启动调度器 (一直运行, Ctrl+C 退出) ===", lines)
-    log(f"  间隔: {args.interval} 秒 ({args.interval/60:.1f} 分钟)", lines)
     log(f"  模式: {'收菜+种菜' if not args.harvest_only and not args.plant_only else ('只收菜' if args.harvest_only else '只种菜')}", lines)
     log(f"  CDP 端口: {args.port}", lines)
     log(f"  用户目录: {user_data_dir}", lines)
     log(f"  启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", lines)
+    log(f"  间隔策略: 由 auto_plant.py 决定 (默认 {DEFAULT_NEXT_INTERVAL}s = {DEFAULT_NEXT_INTERVAL/60:.0f} 分钟)", lines)
 
     # 先确保 Edge 已起 + CDP 端口可连
     if not args.no_launch_edge:
@@ -193,16 +208,18 @@ def main():
                 # 收完后等几秒, 让 Vue 状态稳定
                 log("等待 3s 让 Vue 状态稳定...", lines)
                 time.sleep(3)
-            # 种菜
+            # 种菜 (auto_plant.py 通过 stdout NEXT_INTERVAL=NNN 决定下次循环间隔)
+            this_interval = DEFAULT_NEXT_INTERVAL
             if not args.harvest_only:
                 plant_extra = [a for a in args.plant_args.split() if a]
-                run_script("auto_plant.py", lines, plant_extra, env=child_env)
+                _, captured = run_script("auto_plant.py", lines, plant_extra, env=child_env)
+                this_interval = parse_next_interval(captured)
                 log("等待 3s 让 Vue 状态稳定...", lines)
                 time.sleep(3)
 
             # 等下一轮
-            log(f"下一轮在 {args.interval} 秒后 ({args.interval/60:.1f} 分钟)...", lines)
-            time.sleep(args.interval)
+            log(f"下一轮在 {this_interval} 秒后 ({this_interval/60:.1f} 分钟)...", lines)
+            time.sleep(this_interval)
     except KeyboardInterrupt:
         log(f"\n[!] 用户中断, 停止调度器 (累计 {cycle} 轮)", lines)
         log(f"  停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", lines)

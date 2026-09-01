@@ -32,8 +32,25 @@ DEBUG_PORT = int(os.environ.get("FARM_DEBUG_PORT", "9222"))
 MAX_RETRY = 2
 RETRY_GAP = 1.0
 DRY_RUN = True
-SEED_NAME = "胡萝卜"
+SEED_NAME = "胡萝卜"  # 默认种子
 ONLY_PLOT: Optional[int] = None  # 只处理某个 plot
+
+# 按时段选种子:
+#   键 = (起始小时, 结束小时) 半开区间, 起始包含, 结束不包含
+#   值 = 种子名
+# 时钟走到该区间时, 当次执行自动选对应种子; 其余时段用默认 SEED_NAME
+# (CLI --seed 显式指定会覆盖下面所有规则)
+SEED_BY_HOUR: Dict[tuple, str] = {
+    (0, 1): "菠萝",  # 0:00–0:59 种菠萝 (就这一次), 其他时段种胡萝卜
+}
+
+# 种子的下次启动间隔(秒): 走完一次种菜后, 等多久再种下一轮
+# 没列出的种子用默认 30 分钟 (1800s)
+NEXT_INTERVAL_BY_SEED: Dict[str, int] = {
+    "菠萝": 405 * 60,  # 6 小时 45 分 = 405 分钟 = 24300 秒
+    # "胡萝卜": 30 * 60,  # 默认 1800, 不写也行
+}
+DEFAULT_NEXT_INTERVAL = 30 * 60  # 30 分钟
 
 
 # 强制 stdout/stderr 用 UTF-8 (Windows 默认 GBK, 中文 + 特殊字符会乱码/崩)
@@ -584,6 +601,9 @@ def main():
     log(f"\n[+] 需种菜地块: {len(to_plant)} 个 {[p['plotNo'] for p in to_plant]}")
     if not to_plant:
         log("  没有空地块, 退出")
+        # 没种菜, 默认 30 分钟后再启动
+        nxt = DEFAULT_NEXT_INTERVAL
+        log(f"[+] NEXT_INTERVAL={nxt}  (没空地块, 下次 {nxt/60:.0f} 分钟后启动)")
         cdp.close(); return 0
 
     summary = []
@@ -869,6 +889,15 @@ def main():
     for s in summary:
         log(f"  {'✓' if s['ok'] else '✗'} 地块{s['plotNo']}  stage={s.get('stage')}  reason={s.get('reason','-')}")
 
+    # 决定下次启动间隔:
+    #   本次至少种成功 1 个 → 按 SEED_NAME 查 NEXT_INTERVAL_BY_SEED
+    #   本次没种出菜 (没空地 / 全失败) → 默认 30 分钟
+    if succ > 0:
+        nxt = NEXT_INTERVAL_BY_SEED.get(SEED_NAME, DEFAULT_NEXT_INTERVAL)
+    else:
+        nxt = DEFAULT_NEXT_INTERVAL
+    log(f"[+] NEXT_INTERVAL={nxt}  (种 {SEED_NAME} {'成功 '+str(succ)+' 块' if succ>0 else '本次没种出菜'}, 下次 {nxt/60:.0f} 分钟后启动)")
+
     cdp.close()
     return 0
 
@@ -877,14 +906,27 @@ if __name__ == "__main__":
     args = ["--real"]
     if "--real" in args:
         DRY_RUN = False; args.remove("--real")
+    explicit_seed = None  # CLI 显式指定时, 跳过按时间选种子
     if "--seed" in args:
         i = args.index("--seed")
         if i + 1 < len(args):
-            SEED_NAME = args[i + 1]
+            explicit_seed = args[i + 1]
+            SEED_NAME = explicit_seed
             args = args[:i] + args[i+2:]
     if "--plot" in args:
         i = args.index("--plot")
         if i + 1 < len(args):
             ONLY_PLOT = int(args[i + 1])
             args = args[:i] + args[i+2:]
+
+    # CLI 没显式 --seed 时, 按当前小时查 SEED_BY_HOUR
+    if explicit_seed is None:
+        from datetime import datetime
+        h = datetime.now().hour
+        for (lo, hi), seed in SEED_BY_HOUR.items():
+            if lo <= h < hi:
+                SEED_NAME = seed
+                print(f"[+] 时段 {lo:02d}:00–{hi:02d}:59 → 自动选种子: {SEED_NAME}")
+                break
+
     sys.exit(main())

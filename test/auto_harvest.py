@@ -384,4 +384,6 @@ if __name__ == "__main__":
         if i + 1 < len(args):
             TARGET_ACTIONS = args[i + 1]
             args = args[:i] + args[i+2:]
+    # 收菜不决定下次间隔, 始终 30 分钟
+    print(f"[+] NEXT_INTERVAL={30*60}  (收菜固定 30 分钟)")
     sys.exit(main())
