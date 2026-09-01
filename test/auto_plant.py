@@ -31,7 +31,7 @@ except ImportError:
 DEBUG_PORT = int(os.environ.get("FARM_DEBUG_PORT", "9222"))
 MAX_RETRY = 2
 RETRY_GAP = 1.0
-DRY_RUN = True
+DRY_RUN = False
 SEED_NAME = "胡萝卜"  # 默认种子
 ONLY_PLOT: Optional[int] = None  # 只处理某个 plot
 
@@ -516,6 +516,144 @@ SCROLL_TO_BTN_JS = r"""
 """
 
 
+# 道具弹窗里找"双倍经验卡"的"使用"按钮
+# 弹窗结构: el-dialog 标题"使用道具", 多个菜单项, 每项含"道具名"+"消耗/等级"+"使用"按钮
+# 不依赖 hash, 按文本匹配
+LOCATE_PROP_USE_BTN_JS = r"""
+(() => {
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+
+  // 找"真的"弹窗: el-overlay > el-dialog, 有非 0 rect + 有 button
+  let dialog = null;
+  const allOverlays = document.querySelectorAll('div.el-overlay');
+  for (const ov of allOverlays) {
+    const d = ov.querySelector('div.el-dialog');
+    if (!d) continue;
+    const r = d.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
+      dialog = d; break;
+    }
+  }
+  if (!dialog) return { ok: false, reason: '道具弹窗未真正出现' };
+  if (!document.body.contains(dialog)) return { ok: false, reason: '道具弹窗 detached' };
+
+  // 找含"双倍经验卡"文本的叶子节点
+  const candidates = Array.from(dialog.querySelectorAll('*'))
+    .filter(e => norm(e.innerText) === '双倍经验卡' && e.children.length === 0);
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      reason: '道具弹窗里没找到"双倍经验卡"文本',
+      debug: {
+        rawText: (dialog.innerText || '').slice(0, 500),
+        allTexts: Array.from(new Set(Array.from(dialog.querySelectorAll('span, div, p, button'))
+          .map(e => norm(e.innerText)).filter(t => t && t.length <= 30))).slice(0, 30),
+      },
+    };
+  }
+
+  // 从"双倍经验卡"向上找最近的菜单项: 含直接子 button 文本 = "使用"
+  let menuItem = null;
+  let useBtn = null;
+  for (const span of candidates) {
+    let el = span;
+    for (let i = 0; i < 6; i++) {
+      el = el.parentElement;
+      if (!el || !dialog.contains(el)) break;
+      const btns = Array.from(el.querySelectorAll(':scope > button'));
+      const btn = btns.find(b => norm(b.innerText) === '使用' && !b.hasAttribute('disabled'));
+      if (btn) { menuItem = el; useBtn = btn; break; }
+    }
+    if (menuItem) break;
+  }
+  if (!menuItem || !useBtn) {
+    return { ok: false, reason: `找到 ${candidates.length} 个"双倍经验卡"文本但都没找到"使用"按钮` };
+  }
+  if (!document.body.contains(useBtn)) return { ok: false, reason: '使用按钮 detached' };
+
+  const r = useBtn.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return { ok: false, reason: '使用按钮 0-size' };
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  const inViewport = r.top >= 0 && r.bottom <= window.innerHeight
+                  && r.left >= 0 && r.right <= window.innerWidth;
+  return {
+    ok: true,
+    x, y, w: r.width, h: r.height,
+    inViewport,
+    btnCls: useBtn.getAttribute('class') || '',
+    menuItemText: norm(menuItem.innerText).replace(/\s+/g, ' ').slice(0, 100),
+  };
+})()
+"""
+
+
+# 找地块"道具"按钮的坐标(用来触发弹窗)
+# 逻辑和 LOCATE_PLOT_PLANT_BTN_JS 一模一样: 文本=道具 的 button, 向上找含"地块 plotNo"的容器
+LOCATE_PLOT_PROP_BTN_JS = r"""
+((args) => {
+  const { plotNo } = args;
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok: false, reason: 'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
+
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+
+  // 关键: 不能直接遍历所有按钮, 因为祖先链里可能含更高级别含"地块 plotNo" 的祖先(整个 ARTICLE 都有所有地块号)
+  // 思路: 先找每个按钮所属的地块(plotBox = 向上找最近的同时含"地块 N"+含 button 的容器, N 最小),
+  //      然后按 plotBox 内的按钮文本="道具" 且 plotBox 的 plotNo 匹配 来定位
+  const allBtns = Array.from(second.querySelectorAll('button'))
+    .filter(b => norm(b.innerText) === '道具' && !b.hasAttribute('disabled'));
+  let btn = null;
+  const seenPlotBoxes = new Set();
+  // 收集所有"按钮 → 地块号"映射 (同一地块可能有多个按钮, 只记一次 plotBox)
+  const buttonToPlotNo = new Map();
+  for (const b of allBtns) {
+    let plotBox = null;
+    let el = b;
+    for (let i = 0; i < 6 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      if (/地块\s*\d+/.test(t) && el.querySelectorAll('button').length > 0) {
+        plotBox = el; break;
+      }
+      el = el.parentElement;
+    }
+    if (!plotBox) continue;
+    if (seenPlotBoxes.has(plotBox)) continue;  // 同一地块多个按钮只算一次
+    seenPlotBoxes.add(plotBox);
+    const boxText = norm(plotBox.innerText || '');
+    // 找 plotBox 内**最小**的地块号 (避免外层 ARTICLE 含所有地块)
+    let minPlotNo = Infinity;
+    for (const m of boxText.matchAll(/地块\s*(\d+)/g)) {
+      const n = parseInt(m[1]);
+      if (n < minPlotNo) minPlotNo = n;
+    }
+    if (minPlotNo === Infinity) continue;
+    buttonToPlotNo.set(b, minPlotNo);
+  }
+  // 按 plotNo 找匹配按钮
+  for (const [b, n] of buttonToPlotNo) {
+    if (n === plotNo) { btn = b; break; }
+  }
+  if (!btn) {
+    const dbg = Array.from(buttonToPlotNo.entries()).map(([b, n]) => ({ btnText: norm(b.innerText), plotNo: n }));
+    return { ok: false, reason: `plot ${plotNo} 无"道具"按钮(候选: ${JSON.stringify(dbg)})` };
+  }
+  if (!document.body.contains(btn)) return { ok: false, reason: '道具按钮 detached' };
+
+  const r = btn.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return { ok: false, reason: '按钮 0-size' };
+  return {
+    ok: true, plotNo,
+    x: r.left + r.width / 2, y: r.top + r.height / 2,
+    w: r.width, h: r.height,
+  };
+})(PROPARGS)
+"""
+
+
 # 找地块"种植"按钮的坐标(用来触发弹窗)
 LOCATE_PLOT_PLANT_BTN_JS = r"""
 ((args) => {
@@ -604,6 +742,8 @@ def main():
         # 没种菜, 默认 30 分钟后再启动
         nxt = DEFAULT_NEXT_INTERVAL
         log(f"[+] NEXT_INTERVAL={nxt}  (没空地块, 下次 {nxt/60:.0f} 分钟后启动)")
+        # 没种出菜, 下次收菜动作也用默认
+        log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
         cdp.close(); return 0
 
     summary = []
@@ -880,6 +1020,161 @@ def main():
         if ok_seed:
             summary.append({"plotNo": plot_no, "ok": True, "stage": "B"})
 
+            # ==== 阶段 C: 用道具(双倍经验卡) — 仅本次种菠萝时触发 ====
+            if SEED_NAME == "菠萝":
+                log(f"\n[C] 地块{plot_no} 种菠萝成功, 开始用双倍经验卡")
+
+                # C0: 关掉残留弹窗(可能还有 el-overlay 空壳)
+                force_close_dialogs()
+
+                # C1: 找地块 plotNo 的"道具"按钮
+                c_attempt = 0
+                c_locate_ok = False
+                while c_attempt < MAX_RETRY:
+                    c_attempt += 1
+                    expr_c1 = LOCATE_PLOT_PROP_BTN_JS.replace(
+                        "PROPARGS", json.dumps({"plotNo": plot_no})
+                    )
+                    prop_pos = js(cdp, expr_c1)
+                    if not prop_pos.get("ok"):
+                        log(f"  ✗ 定位道具按钮失败: {prop_pos.get('reason')} (尝试 {c_attempt})")
+                        time.sleep(RETRY_GAP); continue
+                    log(f"  ✓ 定位地块{plot_no}道具按钮 @({prop_pos['x']:.1f},{prop_pos['y']:.1f})")
+                    c_locate_ok = True; break
+                if not c_locate_ok:
+                    summary.append({"plotNo": plot_no, "ok": False, "stage": "C-locate",
+                                    "reason": "道具按钮定位失败"})
+                    break
+
+                if DRY_RUN:
+                    log(f"  → [DRY-RUN] 跳过 C2 派发 / C3-C5 真弹窗流程")
+                    continue  # 阶段 B 已成功记, 阶段 C 视为 OK, 进入下一地块
+
+                # C2: 点击道具按钮 (派发 click)
+                c_dispatched = False
+                for _ in range(MAX_RETRY):
+                    expr_c2 = (r"""
+                    (() => {
+                      const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+                      const ad = document.querySelector('.farm-ad-card');
+                      const second = ad.previousElementSibling.children[1];
+                      const allBtns = Array.from(second.querySelectorAll('button'))
+                        .filter(b => norm(b.innerText) === '道具' && !b.hasAttribute('disabled'));
+                      const seen = new Set();
+                      for (const b of allBtns) {
+                        let plotBox = null, el = b;
+                        for (let i = 0; i < 6 && el && second.contains(el); i++) {
+                          const t = norm(el.innerText || '');
+                          if (/地块\s*\d+/.test(t) && el.querySelectorAll('button').length > 0) {
+                            plotBox = el; break;
+                          }
+                          el = el.parentElement;
+                        }
+                        if (!plotBox || seen.has(plotBox)) continue;
+                        seen.add(plotBox);
+                        const boxText = norm(plotBox.innerText || '');
+                        let minN = Infinity;
+                        for (const m of boxText.matchAll(/地块\s*(\d+)/g)) {
+                          const n = parseInt(m[1]); if (n < minN) minN = n;
+                        }
+                        if (minN === """ + str(plot_no) + r""") {
+                          b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+                          b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                          b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+                          return { ok: true };
+                        }
+                      }
+                      return { ok: false, reason: 'not found' };
+                    })()
+                    """)
+                    disp = js(cdp, expr_c2)
+                    if not disp.get("ok"):
+                        log(f"  ✗ 派发道具点击失败: {disp.get('reason')}")
+                        time.sleep(RETRY_GAP); continue
+                    c_dispatched = True; break
+                if not c_dispatched:
+                    summary.append({"plotNo": plot_no, "ok": False, "stage": "C-dispatch",
+                                    "reason": "道具按钮派发失败"})
+                    break
+
+                # C3: 等弹窗 + 找"双倍经验卡"+"使用"按钮
+                time.sleep(1.5)
+                c_use_pos = js(cdp, LOCATE_PROP_USE_BTN_JS)
+                if not c_use_pos.get("ok"):
+                    log(f"  ✗ 道具弹窗里没找到双倍经验卡: {c_use_pos.get('reason')}")
+                    if c_use_pos.get("debug"):
+                        log(f"  ── 弹窗文本: {c_use_pos['debug'].get('rawText','')!r}")
+                    summary.append({"plotNo": plot_no, "ok": False, "stage": "C-pickup",
+                                    "reason": c_use_pos.get("reason", "双倍经验卡未找到")})
+                    break
+                log(f"  ✓ 找到双倍经验卡: {c_use_pos.get('menuItemText','')!r}")
+                log(f"  ✓ 使用按钮 @({c_use_pos['x']:.1f},{c_use_pos['y']:.1f}) inViewport={c_use_pos.get('inViewport')}")
+
+                # C4: 点击"使用"按钮 (派发 click)
+                expr_c4 = (r"""
+                (() => {
+                  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+                  // 找"双倍经验卡"菜单项里的"使用"按钮
+                  const candidates = Array.from(document.querySelectorAll('*'))
+                    .filter(e => norm(e.innerText) === '双倍经验卡' && e.children.length === 0);
+                  for (const span of candidates) {
+                    let el = span;
+                    for (let i = 0; i < 6; i++) {
+                      el = el.parentElement;
+                      if (!el) break;
+                      const btns = Array.from(el.querySelectorAll(':scope > button'));
+                      const btn = btns.find(b => norm(b.innerText) === '使用' && !b.hasAttribute('disabled'));
+                      if (btn) {
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+                        btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                        btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+                        return { ok: true };
+                      }
+                    }
+                  }
+                  return { ok: false, reason: 'not found' };
+                })()
+                """)
+                c_use_dispatched = False
+                for _ in range(MAX_RETRY):
+                    disp = js(cdp, expr_c4)
+                    if not disp.get("ok"):
+                        log(f"  ✗ 派发使用按钮失败: {disp.get('reason')}")
+                        time.sleep(RETRY_GAP); continue
+                    c_use_dispatched = True; break
+                if not c_use_dispatched:
+                    summary.append({"plotNo": plot_no, "ok": False, "stage": "C-dispatch-use",
+                                    "reason": "使用按钮派发失败"})
+                    break
+
+                # C5: 等 2s + 验证弹窗消失(说明道具被用掉了)
+                time.sleep(2)
+                verify_expr = r"""
+                (() => {
+                  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+                  // 找真弹窗
+                  const allOverlays = document.querySelectorAll('div.el-overlay');
+                  for (const ov of allOverlays) {
+                    const d = ov.querySelector('div.el-dialog');
+                    if (!d) continue;
+                    const r = d.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
+                      // 真弹窗还在
+                      return { gone: false, texts: Array.from(d.querySelectorAll('span,div,p')).slice(0, 5).map(e => norm(e.innerText).slice(0, 30)) };
+                    }
+                  }
+                  return { gone: true };
+                })()
+                """
+                verify = js(cdp, verify_expr)
+                if verify.get("gone"):
+                    log(f"  ✓ 道具弹窗已消失, 双倍经验卡使用成功")
+                else:
+                    log(f"  ⚠ 道具弹窗还在, 可能点错或被遮挡")
+                    summary.append({"plotNo": plot_no, "ok": False, "stage": "C-verify",
+                                    "reason": "弹窗未消失"})
+                    break
+
     # ===== 总结 =====
     log("\n" + "=" * 60)
     log("[总结]")
@@ -897,6 +1192,14 @@ def main():
     else:
         nxt = DEFAULT_NEXT_INTERVAL
     log(f"[+] NEXT_INTERVAL={nxt}  (种 {SEED_NAME} {'成功 '+str(succ)+' 块' if succ>0 else '本次没种出菜'}, 下次 {nxt/60:.0f} 分钟后启动)")
+
+    # 决定下次收菜要处理的动作: 仅本次种菠萝时, 加"道具"动作
+    # (scheduler.py 会读这行, 加到下次 auto_harvest.py 的 --action 里)
+    if succ > 0 and SEED_NAME == "菠萝":
+        # 收菜时如果页面有"道具"按钮就派发点击; 没有就跳过(不会硬找)
+        log(f"[+] NEXT_HARVEST_ACTIONS=道具,翻地,收获  (种了菠萝, 下次收菜顺带按道具按钮)")
+    else:
+        log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
 
     cdp.close()
     return 0

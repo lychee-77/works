@@ -102,6 +102,18 @@ def parse_next_interval(captured_stdout: str) -> int:
     return DEFAULT_NEXT_INTERVAL
 
 
+def parse_next_harvest_actions(captured_stdout: str, default: str = "翻地,收获") -> list:
+    """从子进程 stdout 找 'NEXT_HARVEST_ACTIONS=道具,翻地,收获', 解析成 list[str]"""
+    import re
+    for line in captured_stdout.splitlines():
+        m = re.search(r"NEXT_HARVEST_ACTIONS\s*=\s*(.+?)(?:\s|$)", line)
+        if m:
+            actions = [a.strip() for a in m.group(1).split(",") if a.strip()]
+            if actions:
+                return actions
+    return [a.strip() for a in default.split(",") if a.strip()]
+
+
 def find_edge_exe():
     """按常见路径找 msedge.exe, 找到返回绝对路径, 否则返回 None"""
     for p in EDGE_PATHS:
@@ -197,13 +209,19 @@ def main():
             log("[!] Edge 不可用, 后续脚本大概率会失败, 仍继续 (按 Ctrl+C 中止)", lines)
 
     cycle = 0
+    # 本轮收菜要处理的动作; 第一轮用默认, 之后每轮用上轮 auto_plant.py 传来的
+    next_harvest_actions = ["翻地", "收获"]
     try:
         while True:
             cycle += 1
             log(f"\n========== 第 {cycle} 轮 ==========", lines)
-            # 收菜
+            # 收菜 (动作列表由上轮 auto_plant.py 决定)
             if not args.plant_only:
-                harvest_extra = [a for a in args.harvest_args.split() if a]
+                # CLI --harvest-args 透传的内容 + 自动注入的 --action
+                extra_from_cli = [a for a in args.harvest_args.split() if a]
+                # 自动注入 --action <列表>
+                auto_args = ["--action", ",".join(next_harvest_actions)]
+                harvest_extra = extra_from_cli + auto_args
                 run_script("auto_harvest.py", lines, harvest_extra, env=child_env)
                 # 收完后等几秒, 让 Vue 状态稳定
                 log("等待 3s 让 Vue 状态稳定...", lines)
@@ -214,6 +232,9 @@ def main():
                 plant_extra = [a for a in args.plant_args.split() if a]
                 _, captured = run_script("auto_plant.py", lines, plant_extra, env=child_env)
                 this_interval = parse_next_interval(captured)
+                # 解析"下次收菜动作列表"
+                next_harvest_actions = parse_next_harvest_actions(captured)
+                log(f"  📋 下次收菜动作: {next_harvest_actions}", lines)
                 log("等待 3s 让 Vue 状态稳定...", lines)
                 time.sleep(3)
 
