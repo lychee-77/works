@@ -11,12 +11,11 @@ pip install -r requirements.txt
 
 1800 = 30分钟*60秒
 ```
-python scheduler.py --interval 1800
+python scheduler.py --interval 1800
 ```
 账号 B (独立端口 9333 + 独立用户目录,登录态互不干扰):
-
+需要给 scheduler.py / auto_harvest.py / auto_plant.py 都加 --port 参数,
+并改 Edge 启动时 --user-data-dir 互不冲突。改完后命令:
 ```
-python scheduler.py --interval 1800 
---port 9333 --profile 
-edge-farm-profile-2
+python scheduler.py --interval 1800 --port 9333 --profile edge-farm-profile-2
 ```

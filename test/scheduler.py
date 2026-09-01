@@ -30,8 +30,8 @@ except Exception:
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEBUG_PORT = 9222
-EDGE_USER_DATA_DIR = os.path.join(HERE, "edge-farm-profile")
+DEFAULT_DEBUG_PORT = 9222
+DEFAULT_EDGE_USER_DATA_DIR = os.path.join(HERE, "edge-farm-profile")
 FARM_URL = "https://www.duanwuqiufenmao.top/farm"
 
 # 常见 Edge 安装位置
@@ -49,7 +49,7 @@ def log(msg, lines):
     lines.append(line)
 
 
-def run_script(name, lines, extra_args=None):
+def run_script(name, lines, extra_args=None, env=None):
     """运行 auto_xxx.py, 实时打印输出, 返回是否成功"""
     path = os.path.join(HERE, name)
     if not os.path.exists(path):
@@ -57,11 +57,16 @@ def run_script(name, lines, extra_args=None):
         return False
     log(f"=== 开始执行 {name} ===", lines)
     try:
+        # 把当前调试端口/用户目录通过环境变量透传给子脚本
+        child_env = os.environ.copy()
+        if env:
+            child_env.update(env)
         # 子脚本已强制 UTF-8 输出, 这里也用 UTF-8 读
         proc = subprocess.Popen(
             [sys.executable, path] + (extra_args or []),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", cwd=HERE,
+            env=child_env,
         )
         for stdout_line in iter(proc.stdout.readline, ""):
             if stdout_line:
@@ -89,7 +94,7 @@ def find_edge_exe():
     return None
 
 
-def is_debug_port_up(port=DEBUG_PORT, timeout=1.5):
+def is_debug_port_up(port, timeout=1.5):
     """CDP 端口是否在监听"""
     try:
         with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=timeout) as r:
@@ -98,23 +103,23 @@ def is_debug_port_up(port=DEBUG_PORT, timeout=1.5):
         return False
 
 
-def launch_edge(lines):
+def launch_edge(lines, port, user_data_dir):
     """以远程调试模式启动 Edge; 已起来则跳过"""
-    if is_debug_port_up():
-        log(f"Edge CDP 端口 {DEBUG_PORT} 已就绪, 跳过启动", lines)
+    if is_debug_port_up(port):
+        log(f"Edge CDP 端口 {port} 已就绪, 跳过启动", lines)
         return True
 
     exe = find_edge_exe()
     if not exe:
-        log(f"[!] 找不到 msedge.exe, 请手动启动 Edge 并加 --remote-debugging-port={DEBUG_PORT}", lines)
+        log(f"[!] 找不到 msedge.exe, 请手动启动 Edge 并加 --remote-debugging-port={port}", lines)
         log("    或把 msedge.exe 装到以下任一位置: " + " | ".join(EDGE_PATHS), lines)
         return False
 
     log(f"Edge 未启动, 准备拉起: {exe}", lines)
     args = [
         exe,
-        f"--remote-debugging-port={DEBUG_PORT}",
-        f"--user-data-dir={EDGE_USER_DATA_DIR}",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
         "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
@@ -129,12 +134,12 @@ def launch_edge(lines):
     # 等端口起来, 最多 15s
     for i in range(30):
         time.sleep(0.5)
-        if is_debug_port_up():
-            log(f"Edge CDP 端口 {DEBUG_PORT} 已就绪 (用时 ~{(i+1)*0.5:.1f}s)", lines)
+        if is_debug_port_up(port):
+            log(f"Edge CDP 端口 {port} 已就绪 (用时 ~{(i+1)*0.5:.1f}s)", lines)
             # 再多等一会儿, 让 /json 里的目标 tab 注册进来
             time.sleep(1.5)
             return True
-    log(f"[!] Edge 启动了但 {DEBUG_PORT} 端口 15s 内未响应", lines)
+    log(f"[!] Edge 启动了但 {port} 端口 15s 内未响应", lines)
     return False
 
 
@@ -146,17 +151,34 @@ def main():
     parser.add_argument("--harvest-args", default="", help="透传给 auto_harvest.py 的额外参数")
     parser.add_argument("--plant-args", default="", help="透传给 auto_plant.py 的额外参数")
     parser.add_argument("--no-launch-edge", action="store_true", help="不自动启动 Edge (默认会自动以远程调试模式拉起)")
+    parser.add_argument("--port", type=int, default=DEFAULT_DEBUG_PORT, help=f"Edge CDP 端口 (默认 {DEFAULT_DEBUG_PORT}, 多账号互不冲突: 9222/9333/9444 ...)")
+    parser.add_argument("--profile", default="edge-farm-profile", help="Edge 用户目录名 (相对脚本所在目录, 多账号每个要不同)")
     args = parser.parse_args()
+
+    # 用户目录支持相对路径(相对 HERE)或绝对路径
+    if os.path.isabs(args.profile):
+        user_data_dir = args.profile
+    else:
+        user_data_dir = os.path.join(HERE, args.profile)
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    # 通过环境变量把端口/用户目录透传给子脚本
+    child_env = {
+        "FARM_DEBUG_PORT": str(args.port),
+        "FARM_USER_DATA_DIR": user_data_dir,
+    }
 
     lines = []
     log(f"=== 启动调度器 (一直运行, Ctrl+C 退出) ===", lines)
     log(f"  间隔: {args.interval} 秒 ({args.interval/60:.1f} 分钟)", lines)
     log(f"  模式: {'收菜+种菜' if not args.harvest_only and not args.plant_only else ('只收菜' if args.harvest_only else '只种菜')}", lines)
+    log(f"  CDP 端口: {args.port}", lines)
+    log(f"  用户目录: {user_data_dir}", lines)
     log(f"  启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", lines)
 
     # 先确保 Edge 已起 + CDP 端口可连
     if not args.no_launch_edge:
-        if not launch_edge(lines):
+        if not launch_edge(lines, args.port, user_data_dir):
             log("[!] Edge 不可用, 后续脚本大概率会失败, 仍继续 (按 Ctrl+C 中止)", lines)
 
     cycle = 0
@@ -167,14 +189,14 @@ def main():
             # 收菜
             if not args.plant_only:
                 harvest_extra = [a for a in args.harvest_args.split() if a]
-                run_script("auto_harvest.py", lines, harvest_extra)
+                run_script("auto_harvest.py", lines, harvest_extra, env=child_env)
                 # 收完后等几秒, 让 Vue 状态稳定
                 log("等待 3s 让 Vue 状态稳定...", lines)
                 time.sleep(3)
             # 种菜
             if not args.harvest_only:
                 plant_extra = [a for a in args.plant_args.split() if a]
-                run_script("auto_plant.py", lines, plant_extra)
+                run_script("auto_plant.py", lines, plant_extra, env=child_env)
                 log("等待 3s 让 Vue 状态稳定...", lines)
                 time.sleep(3)
 

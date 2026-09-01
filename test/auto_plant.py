@@ -28,7 +28,7 @@ try:
 except ImportError:
     raise SystemExit("缺少依赖: pip install websocket-client")
 
-DEBUG_PORT = 9222
+DEBUG_PORT = int(os.environ.get("FARM_DEBUG_PORT", "9222"))
 MAX_RETRY = 2
 RETRY_GAP = 1.0
 DRY_RUN = True
@@ -83,6 +83,10 @@ def js(cdp, expr):
     if "exceptionDetails" in r:
         raise RuntimeError(f"JS: {r['exceptionDetails'].get('text','')}")
     return r.get("result", {}).get("value")
+
+
+def build_dispatch_plot_plant_btn_js(plot_no: int) -> str:
+    return DISPATCH_PLOT_PLANT_BTN_JS.replace("__PLOTNO__", str(plot_no))
 
 
 def click_at(cdp, x, y, button="left"):
@@ -154,6 +158,39 @@ DISPATCH_CLICK_JS = r"""
 """
 
 
+# 地块"种植"按钮 DOM 派发: 按 plotNo 找按钮, 派发 click + pointer 事件
+# 占位符: __PLOTNO__
+DISPATCH_PLOT_PLANT_BTN_JS = r"""
+(() => {
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok: false, reason: 'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
+
+  // 不依赖 hash: 从 button("种植") 向上找含"地块 plotNo"的容器
+  const plantBtns = Array.from(second.querySelectorAll('button'))
+    .filter(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
+  for (const b of plantBtns) {
+    let el = b;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      const re = new RegExp(`地块\\s*${__PLOTNO__}(?!\\d)`);
+      if (re.test(t)) {
+        b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+        b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+        b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+        return { ok: true, no: __PLOTNO__ };
+      }
+      el = el.parentElement;
+    }
+  }
+  return { ok: false, reason: 'plot plant btn not found' };
+})()
+"""
+
+
 # ============== JS 片段 ==============
 
 FETCH_PLOTS_JS = r"""
@@ -166,37 +203,55 @@ FETCH_PLOTS_JS = r"""
   if (!second) return { ok: false, reason: 'no second' };
 
   // 统一去零宽字符 + trim
-  // 覆盖: \u200b ZWSP, \u200c ZWNJ, \u200d ZWJ, \u2060 WJ, \ufeff ZWNBSP
-  // 额外加 \u00ad SOFT HYPHEN (某些字体里会粘进文本)
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
-  const found = new Set();
-  for (const c of second.children) {
-    if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  }
-  for (const c of second.children) {
-    for (const g of c.children) {
-      if (g.className && g.className.includes('_232e48d721')) found.add(g);
-    }
-  }
+  // 不依赖任何 hash. 策略:
+  //   1) 找所有 button 文本 = "种植"
+  //   2) 从 button 向上找最近的容器: 含"地块N"文本 + 含 button
+  //   3) plotNo 从容器 innerText 抓 "地块N"
+  const plantBtns = Array.from(second.querySelectorAll('button'))
+    .filter(b => norm(b.innerText) === '种植');
+  const seen = new Set();
   const plots = [];
-  for (const p of found) {
-    const status = norm(p.querySelector('[class*="_6ac191ba6b"]')?.innerText);
-    const m = status.match(/地块\s*(\d+)/);
-    const plotNo = m ? parseInt(m[1]) : 0;
-    const cls = (p.className || '').split(/\s+/);
-    // "empty" 是空地, "ripe" 是成熟, 其他视为有作物
-    const isEmpty = cls.includes('empty');
+  for (const btn of plantBtns) {
+    if (btn.hasAttribute('disabled')) continue;
 
-    // 找"种植"按钮
-    const btns = Array.from(p.querySelectorAll('button'));
-    const plantBtn = btns.find(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
+    // 找 plotBox: 向上找同时含"地块N"和 button 的最近容器
+    let plotBox = null;
+    let el = btn;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      if (/地块\s*\d+/.test(t) && el.querySelectorAll('button').length > 0) {
+        plotBox = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+    if (!plotBox) continue;
 
+    // 从 plotBox 抓 plotNo (取最小数字, 避免 "地块N：地块N" 重复)
+    const boxText = norm(plotBox.innerText || '');
+    const m = boxText.match(/地块\s*(\d+)/);
+    if (!m) continue;
+    const plotNo = parseInt(m[1]);
+    if (seen.has(plotNo)) continue;
+    seen.add(plotNo);
+
+    const cls = (plotBox.className || '').split(/\s+/);
+    // 状态文本优先取"地块N：xxx"这种, 没有就用"地块 N"作为标识
+    let status = '';
+    for (const e of plotBox.querySelectorAll('*')) {
+      const t = norm(e.innerText || '');
+      if (/地块\s*\d+[：:]\s*\S/.test(t) && e.children.length <= 1) { status = t; break; }
+    }
+    if (!status) status = `地块 ${plotNo}`;
+    const isEmpty = cls.includes('empty') || /空地/.test(status);
     plots.push({
-      plotNo, state: cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?',
+      plotNo,
+      state: cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?',
       isEmpty,
       status,
-      plantBtn: plantBtn ? { cls: plantBtn.getAttribute('class') || '' } : null,
+      plantBtn: { cls: btn.getAttribute('class') || '' },
     });
   }
   plots.sort((a, b) => a.plotNo - b.plotNo);
@@ -452,31 +507,38 @@ LOCATE_PLOT_PLANT_BTN_JS = r"""
   if (!ad) return { ok: false, reason: 'no ad' };
   const prev = ad.previousElementSibling;
   const second = prev.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
 
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
-  const found = new Set();
-  for (const c of second.children) {
-    if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  }
-  for (const c of second.children) {
-    for (const g of c.children) {
-      if (g.className && g.className.includes('_232e48d721')) found.add(g);
+  // 不依赖 hash: 从 button("种植") 向上找含"地块 plotNo"的容器
+  const plantBtns = Array.from(second.querySelectorAll('button'))
+    .filter(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
+  let btn = null;
+  for (const b of plantBtns) {
+    let el = b;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      const re = new RegExp(`地块\\s*${plotNo}(?!\\d)`);
+      if (re.test(t)) { btn = b; break; }
+      el = el.parentElement;
     }
+    if (btn) break;
   }
-  let target = null;
-  for (const p of found) {
-    const status = norm(p.querySelector('[class*="_6ac191ba6b"]')?.innerText);
-    const m = status.match(/地块\s*(\d+)/);
-    const no = m ? parseInt(m[1]) : 0;
-    if (no === plotNo) { target = p; break; }
+  if (!btn) {
+    // 调试: 列出每个"种植"按钮祖先链的 innerText
+    const dbg = plantBtns.map((b, idx) => {
+      const chain = [];
+      let e = b;
+      for (let i = 0; i < 6; i++) {
+        e = e.parentElement;
+        if (!e || !second.contains(e)) break;
+        chain.push({ depth: i+1, tag: e.tagName, text: norm(e.innerText).slice(0, 60) });
+      }
+      return { idx, btnText: norm(b.innerText), chain };
+    });
+    return { ok: false, reason: `plot ${plotNo} 无"种植"按钮(共 ${plantBtns.length} 个候选种植按钮)`, debug: dbg };
   }
-  if (!target) return { ok: false, reason: `plot ${plotNo} not found` };
-  if (!document.body.contains(target)) return { ok: false, reason: 'plot detached' };
-
-  const btns = Array.from(target.querySelectorAll('button'));
-  const btn = btns.find(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
-  if (!btn) return { ok: false, reason: `plot ${plotNo} 无"种植"按钮(有 ${btns.length} 个按钮: ${btns.map(b => norm(b.innerText)).join('|')})` };
   if (!document.body.contains(btn)) return { ok: false, reason: '种植按钮 detached' };
 
   const r = btn.getBoundingClientRect();
@@ -604,38 +666,18 @@ def main():
                 pos = js(cdp, expr_a)
                 if not pos.get("ok"):
                     log(f"  ✗ 定位失败: {pos.get('reason')} (尝试 {attempt})")
+                    if pos.get("debug"):
+                        log(f"  ── 种植按钮祖先链 ──")
+                        for d in pos["debug"]:
+                            log(f"     btn[{d['idx']}] '{d['btnText']}' 链:")
+                            for c in d.get("chain", []):
+                                log(f"       depth={c['depth']} <{c['tag']}> text={c['text']!r}")
                     if attempt < MAX_RETRY: time.sleep(RETRY_GAP); continue
                     summary.append({"plotNo": plot_no, "ok": False, "stage": "A", "reason": pos.get("reason")})
                     break
                 log(f"  ✓ 定位地块{plot_no}种植按钮 @({pos['x']:.1f},{pos['y']:.1f})")
                 if not DRY_RUN:
-                    a_click2 = js(cdp, r'''
-(() => {
-  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-  const ad = document.querySelector('.farm-ad-card');
-  const prev = ad.previousElementSibling;
-  const second = prev.children[1];
-  const found = new Set();
-  for (const c of second.children) if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  for (const c of second.children) for (const g of c.children) if (g.className && g.className.includes('_232e48d721')) found.add(g);
-  for (const p of found) {
-    const status = norm(p.querySelector('[class*="_6ac191ba6b"]')?.innerText);
-    const m = status.match(/地块\s*(\d+)/);
-    const no = m ? parseInt(m[1]) : 0;
-    if (no === PLOTNO) {
-      const btns = Array.from(p.querySelectorAll('button'));
-      const b = btns.find(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
-      if (b) {
-        b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
-        b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-        b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-        return { ok: true, no };
-      }
-    }
-  }
-  return { ok: false, reason: 'plot plant btn not found' };
-})()
-                    '''.replace("PLOTNO", str(plot_no)))
+                    a_click2 = js(cdp, build_dispatch_plot_plant_btn_js(plot_no))
                     if a_click2.get("ok"):
                         log(f"  → DOM 派发地块{plot_no}'种植'成功")
                     else:
@@ -667,33 +709,7 @@ def main():
                     break
                 log(f"  ✓ 定位地块{plot_no}种植按钮 @({pos['x']:.1f},{pos['y']:.1f})")
                 if not DRY_RUN:
-                    a_click2 = js(cdp, r'''
-(() => {
-  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-  const ad = document.querySelector('.farm-ad-card');
-  const prev = ad.previousElementSibling;
-  const second = prev.children[1];
-  const found = new Set();
-  for (const c of second.children) if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  for (const c of second.children) for (const g of c.children) if (g.className && g.className.includes('_232e48d721')) found.add(g);
-  for (const p of found) {
-    const status = norm(p.querySelector('[class*="_6ac191ba6b"]')?.innerText);
-    const m = status.match(/地块\s*(\d+)/);
-    const no = m ? parseInt(m[1]) : 0;
-    if (no === PLOTNO) {
-      const btns = Array.from(p.querySelectorAll('button'));
-      const b = btns.find(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
-      if (b) {
-        b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
-        b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-        b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-        return { ok: true, no };
-      }
-    }
-  }
-  return { ok: false, reason: 'plot plant btn not found' };
-})()
-                    '''.replace("PLOTNO", str(plot_no)))
+                    a_click2 = js(cdp, build_dispatch_plot_plant_btn_js(plot_no))
                     if a_click2.get("ok"):
                         log(f"  → DOM 派发地块{plot_no}'种植'成功")
                     else:
@@ -722,37 +738,7 @@ def main():
                     break
                 log(f"  ✓ 定位地块{plot_no}种植按钮 @({pos['x']:.1f},{pos['y']:.1f})")
                 if not DRY_RUN:
-                    # 优先 DOM 派发
-                    a_click = js(cdp, DISPATCH_CLICK_JS.replace("CLICKARGS",
-                        json.dumps({"text": f"地块{plot_no}_plant", "selectorXPath": None})))
-                    # 上面的 text 找不对, 用 plot 特定方式
-                    a_click2 = js(cdp, r'''
-(() => {
-  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-  const ad = document.querySelector('.farm-ad-card');
-  const prev = ad.previousElementSibling;
-  const second = prev.children[1];
-  const found = new Set();
-  for (const c of second.children) if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  for (const c of second.children) for (const g of c.children) if (g.className && g.className.includes('_232e48d721')) found.add(g);
-  for (const p of found) {
-    const status = norm(p.querySelector('[class*="_6ac191ba6b"]')?.innerText);
-    const m = status.match(/地块\s*(\d+)/);
-    const no = m ? parseInt(m[1]) : 0;
-    if (no === PLOTNO) {
-      const btns = Array.from(p.querySelectorAll('button'));
-      const b = btns.find(b => norm(b.innerText) === '种植' && !b.hasAttribute('disabled'));
-      if (b) {
-        b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
-        b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-        b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-        return { ok: true, no };
-      }
-    }
-  }
-  return { ok: false, reason: 'plot plant btn not found' };
-})()
-                    '''.replace("PLOTNO", str(plot_no)))
+                    a_click2 = js(cdp, build_dispatch_plot_plant_btn_js(plot_no))
                     if a_click2.get("ok"):
                         log(f"  → DOM 派发地块{plot_no}'种植'成功")
                     else:

@@ -24,7 +24,7 @@ try:
 except ImportError:
     raise SystemExit("缺少依赖:pip install websocket-client")
 
-DEBUG_PORT = 9222
+DEBUG_PORT = int(os.environ.get("FARM_DEBUG_PORT", "9222"))
 MAX_RETRY = 2  # 每个地块最多重试 2 次
 RETRY_GAP = 1.2  # 重试前等页面刷新
 # 默认 dry-run(只定位, 不真正点击); 加 --real 才派发真实点击
@@ -104,51 +104,68 @@ FETCH_PLOTS_JS = r"""
   const second = prev.children[1];
   if (!second) return { ok: false, reason: 'no second child' };
 
-  // 用 Set 去重,深度 1~2 找 class 含 _232e48d721
-  const found = new Set();
-  for (const c of second.children) {
-    if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  }
-  for (const c of second.children) {
-    for (const g of c.children) {
-      if (g.className && g.className.includes('_232e48d721')) found.add(g);
-    }
-  }
+  // 统一去零宽字符 + trim
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
+  // 不依赖任何 hash. 策略:
+  //   1) 找所有 button (后续用来判定动作 / 找 plotBox)
+  //   2) 从 button 向上找含"地块N"文本 + 含 button 的容器
+  //   3) state 通过容器 className 里的语义类 (empty/ripe/care/success/danger) 判定
+  const allBtns = Array.from(second.querySelectorAll('button'));
+  const seen = new Set();
   const plots = [];
-    for (const p of found) {
-      const cls = (p.className || '').split(/\s+/);
-      const state = cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?';
-      const status = (p.querySelector('[class*="_6ac191ba6b"]')?.innerText || '').trim();
-      // 去掉零宽字符再匹配地块编号
-      const norm = status.replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '');
-      const m = norm.match(/地块\s*(\d+)/)
-             || (p.querySelector('span')?.innerText || '').replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '').match(/地块\s*(\d+)/);
-      const plotNo = m ? parseInt(m[1]) : 0;
 
-    // 找动作按钮: 优先收获, 否则 --demo 模式用浇水, 否则铲除
-    const normText = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '').trim();
-    const wantActions = (typeof TARGET_ACTIONS !== 'undefined' ? TARGET_ACTIONS : '收获')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    const btns = Array.from(p.querySelectorAll('button'));
-    let actionBtn = null;
-    for (const t of wantActions) {
-      const b = btns.find(x => normText(x.innerText) === t);
-      if (b && !b.hasAttribute('disabled')) { actionBtn = b; break; }
+  // 候选 action 按钮文本 (运行时由 Python 注入)
+  const wantActions = (typeof TARGET_ACTIONS !== 'undefined' ? TARGET_ACTIONS : '收获')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+  for (const btn of allBtns) {
+    const t = norm(btn.innerText);
+    if (!wantActions.includes(t)) continue;
+    if (btn.hasAttribute('disabled')) continue;
+
+    // 找 plotBox: 向上找同时含"地块N" + 含 button 的最近容器
+    let plotBox = null;
+    let el = btn;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const txt = norm(el.innerText || '');
+      if (/地块\s*\d+/.test(txt) && el.querySelectorAll('button').length > 0) {
+        plotBox = el;
+        break;
+      }
+      el = el.parentElement;
     }
+    if (!plotBox) continue;
+
+    const boxText = norm(plotBox.innerText || '');
+    const m = boxText.match(/地块\s*(\d+)/);
+    if (!m) continue;
+    const plotNo = parseInt(m[1]);
+    if (seen.has(plotNo)) continue;
+    seen.add(plotNo);
+
+    const cls = (plotBox.className || '').split(/\s+/);
+    const state = cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?';
+
+    // 状态文本: 优先取"地块N：xxx"
+    let status = '';
+    for (const e of plotBox.querySelectorAll('*')) {
+      const tt = norm(e.innerText || '');
+      if (/地块\s*\d+[：:]\s*\S/.test(tt) && e.children.length <= 1) { status = tt; break; }
+    }
+    if (!status) status = `地块 ${plotNo}`;
 
     plots.push({
       plotNo,
       state,
       status,
-      cls: p.className,
-      // 用一个稳定指纹: 用 innerText 拼起来, 点击后对比是否变化
-      fingerprint: (p.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200),
-      harvestBtn: actionBtn ? {
-        cls: actionBtn.getAttribute('class') || '',
-        text: normText(actionBtn.innerText),
-        disabled: actionBtn.hasAttribute('disabled'),
-      } : null,
+      cls: plotBox.className,
+      fingerprint: (plotBox.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+      harvestBtn: {
+        cls: btn.getAttribute('class') || '',
+        text: t,
+        disabled: false,
+      },
     });
   }
   plots.sort((a, b) => a.plotNo - b.plotNo);
@@ -165,43 +182,33 @@ CLICK_BY_TEXT_JS = r"""
   if (!ad) return { ok: false, reason: 'no ad' };
   const prev = ad.previousElementSibling;
   const second = prev.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
 
-  // 找到对应 plotNo 的地块
-  const found = new Set();
-  for (const c of second.children) {
-    if (c.className && c.className.includes('_232e48d721')) found.add(c);
-  }
-  for (const c of second.children) {
-    for (const g of c.children) {
-      if (g.className && g.className.includes('_232e48d721')) found.add(g);
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+
+  // 不依赖 hash: 从 button(目标 buttonText) 向上找含"地块 plotNo"的容器
+  const allBtns = Array.from(second.querySelectorAll('button'));
+  let targetBtn = null;
+  for (const b of allBtns) {
+    if (norm(b.innerText) !== buttonText) continue;
+    let el = b;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      // 用 word-boundary 风格: "地块 plotNo" 后面不是数字
+      const re = new RegExp(`地块\\s*${plotNo}(?!\\d)`);
+      if (re.test(t)) { targetBtn = b; break; }
+      el = el.parentElement;
     }
+    if (targetBtn) break;
   }
-
-  let target = null;
-  for (const p of found) {
-    const status = (p.querySelector('[class*="_6ac191ba6b"]')?.innerText || '').trim();
-    const norm = status.replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '');
-    const m = norm.match(/地块\s*(\d+)/);
-    const no = m ? parseInt(m[1]) : 0;
-    if (no === plotNo) {
-      target = p;
-      break;
-    }
+  if (!targetBtn) {
+    const sameTextCount = allBtns.filter(b => norm(b.innerText) === buttonText).length;
+    return { ok: false, reason: `button "${buttonText}" not in plot ${plotNo} (共 ${sameTextCount} 个"${buttonText}"按钮)` };
   }
-  if (!target) return { ok: false, reason: 'plot not found' };
-
-  // 校验 plot 还在 DOM
-  if (!document.contains(target)) return { ok: false, reason: 'plot detached' };
-
-  // 找按钮(零宽字符兼容)
-  const normText2 = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '').trim();
-  const btns = Array.from(target.querySelectorAll('button'));
-  const btn = btns.find(b => normText2(b.innerText) === buttonText);
-  if (!btn) return { ok: false, reason: `button "${buttonText}" not in plot ${plotNo} (有 ${btns.length} 个按钮: ${btns.map(b => normText2(b.innerText)).join('|')})` };
-  if (!document.contains(btn)) return { ok: false, reason: 'button detached' };
+  if (!document.contains(targetBtn)) return { ok: false, reason: 'button detached' };
 
   // 取坐标
-  const r = btn.getBoundingClientRect();
+  const r = targetBtn.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return { ok: false, reason: 'button 0-size' };
   const x = r.left + r.width / 2;
   const y = r.top + r.height / 2;
@@ -210,7 +217,7 @@ CLICK_BY_TEXT_JS = r"""
   return {
     ok: true, plotNo, buttonText,
     x, y, w: r.width, h: r.height,
-    btnCls: btn.getAttribute('class') || '',
+    btnCls: targetBtn.getAttribute('class') || '',
   };
 })({ plotNo: PLOTNO, buttonText: BUTTONTEXT })
 """
