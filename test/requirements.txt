@@ -1,0 +1,5 @@
+# farm_cdp.py 依赖
+# 全部为可选依赖,无任何必需项
+#
+# 推荐安装(更稳定的 WebSocket 实现):
+websocket-client>=1.6.0
