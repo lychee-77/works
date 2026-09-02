@@ -355,7 +355,11 @@ def main():
 
     # ===== 逐任务执行: 每地块按 action 顺序, 失败重试 =====
     summary = []
-    for p, action in tasks:
+    ACTION_GAP = 0.5  # 每个动作之间停顿, 让前端有反应时间 (翻地→收获等动画/状态刷新)
+    for task_idx, (p, action) in enumerate(tasks):
+        # 每个动作前等 0.5s (第一个也等, 让 UI 完成初始渲染)
+        log(f"\n⏸  动作间停顿 {ACTION_GAP}s...")
+        time.sleep(ACTION_GAP)
         plot_no = p["plotNo"]
         # 用当前最新的地块数据, 避免上一步改 fingerprint 后还在用旧的
         cur_plot = p
