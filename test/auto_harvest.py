@@ -30,7 +30,8 @@ RETRY_GAP = 1.2  # 重试前等页面刷新
 # 默认 dry-run(只定位, 不真正点击); 加 --real 才派发真实点击
 DRY_RUN = True
 # 要处理的按钮类型(逗号分隔, 优先级从左到右): 收获 / 铲除 / 浇水 / 翻地
-TARGET_ACTIONS = "收获"
+# 默认改为"翻地,收获": 同一地块先翻地, 再收获
+TARGET_ACTIONS = "翻地,收获"
 
 
 # 强制 stdout/stderr 用 UTF-8 (Windows 默认 GBK, 中文 + 特殊字符会乱码/崩)
@@ -111,6 +112,7 @@ def js(cdp, expr):
 
 
 # ============== 抓地块 + 状态判定 ==============
+# 改: 不再按 TARGET_ACTIONS 过滤, 而是收集地块内所有按钮, 决策在 Python 端做
 FETCH_PLOTS_JS = r"""
 (() => {
   const ad = document.querySelector('.farm-ad-card');
@@ -123,24 +125,13 @@ FETCH_PLOTS_JS = r"""
   // 统一去零宽字符 + trim
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
-  // 不依赖任何 hash. 策略:
-  //   1) 找所有 button (后续用来判定动作 / 找 plotBox)
-  //   2) 从 button 向上找含"地块N"文本 + 含 button 的容器
-  //   3) state 通过容器 className 里的语义类 (empty/ripe/care/success/danger) 判定
+  // 策略: 从所有 button 出发, 向上找含"地块N"+含 button 的容器 (plotBox)
+  // 同一 plotBox 内只记一次, 但收集 plotBox 内**所有**按钮文本
   const allBtns = Array.from(second.querySelectorAll('button'));
   const seen = new Set();
   const plots = [];
 
-  // 候选 action 按钮文本 (运行时由 Python 注入)
-  const wantActions = (typeof TARGET_ACTIONS !== 'undefined' ? TARGET_ACTIONS : '收获')
-    .split(',').map(s => s.trim()).filter(Boolean);
-
   for (const btn of allBtns) {
-    const t = norm(btn.innerText);
-    if (!wantActions.includes(t)) continue;
-    if (btn.hasAttribute('disabled')) continue;
-
-    // 找 plotBox: 向上找同时含"地块N" + 含 button 的最近容器
     let plotBox = null;
     let el = btn;
     for (let i = 0; i < 8 && el && second.contains(el); i++) {
@@ -163,7 +154,16 @@ FETCH_PLOTS_JS = r"""
     const cls = (plotBox.className || '').split(/\s+/);
     const state = cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?';
 
-    // 状态文本: 优先取"地块N：xxx"
+    // 收集 plotBox 内所有按钮
+    const btnsInBox = Array.from(plotBox.querySelectorAll('button'));
+    const btnInfo = {};
+    for (const b of btnsInBox) {
+      const t = norm(b.innerText);
+      if (!t) continue;
+      if (!btnInfo[t]) btnInfo[t] = { cls: (b.getAttribute('class')||'').slice(0, 60), disabled: b.hasAttribute('disabled') };
+    }
+
+    // 状态文本
     let status = '';
     for (const e of plotBox.querySelectorAll('*')) {
       const tt = norm(e.innerText || '');
@@ -177,11 +177,9 @@ FETCH_PLOTS_JS = r"""
       status,
       cls: plotBox.className,
       fingerprint: (plotBox.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200),
-      harvestBtn: {
-        cls: btn.getAttribute('class') || '',
-        text: t,
-        disabled: false,
-      },
+      btns: btnInfo,  // {"翻地": {...}, "收获": {...}, "种植": {...}}
+      // 兼容老调用方 (auto_harvest 自己旧逻辑): 第一个"收获"按钮当作 harvestBtn
+      harvestBtn: btnInfo['收获'] ? { text: '收获', disabled: btnInfo['收获'].disabled, cls: btnInfo['收获'].cls } : null,
     });
   }
   plots.sort((a, b) => a.plotNo - b.plotNo);
@@ -297,48 +295,90 @@ def main():
             f"btn={'有('+p['harvestBtn']['text']+')' if p['harvestBtn'] else '无':6s}  "
             f"status={p['status'][:50]!r}")
 
-    # ===== 找可收获的 =====
-    harvestable = [p for p in plots_initial if p["harvestBtn"] and not p["harvestBtn"]["disabled"]]
-    log(f"\n[+] 可收获地块: {len(harvestable)} 个")
-    if not harvestable:
-        # 区分两种 0: 真没东西成熟 vs 没抓到地块
+    # ===== 解析 actions 列表 =====
+    # TARGET_ACTIONS 例: "翻地,收获" → ["翻地", "收获"]
+    # scheduler 通过 --action 注入, 这里再按顺序展开
+    actions = [a.strip() for a in TARGET_ACTIONS.split(",") if a.strip()]
+    log(f"\n[+] 动作列表 (原始传入): {actions}")
+    # 运行时强制规整: 翻地必须在收获之前 (翻地不前置就拿不到"翻地"按钮)
+    # 用户诉求: "按先翻地 再收获的逻辑全部执行"
+    ACTION_ORDER = {"翻地": 0, "收获": 1, "铲除": 2, "浇水": 3, "道具": 4}
+    def _order_key(a):
+        return (ACTION_ORDER.get(a, 99), actions.index(a) if a in actions else 99)
+    actions = sorted(set(actions), key=_order_key)
+    log(f"[+] 动作列表 (规整后, 按地块×动作顺序展开): {actions}")
+
+    # 提取所有"含目标按钮"的地块: 一个地块只要任一 action 按钮存在就算候选
+    # (地块×动作 笛卡尔积, 但跳过"该地块没有这个按钮"的组合)
+    def plot_has_action(plot, action):
+        # 优先用 btns 字典 (新格式, 包含地块内所有按钮)
+        if "btns" in plot and plot["btns"]:
+            info = plot["btns"].get(action)
+            return info is not None and not info.get("disabled")
+        # fallback: harvestBtn 字段 (老格式, 只对应"收获")
+        if "harvestBtn" in plot and plot["harvestBtn"]:
+            return (not plot["harvestBtn"].get("disabled")
+                    and plot["harvestBtn"].get("text") == action)
+        return False
+
+    def plot_action_pair(plot, action):
+        # 取按钮信息 (兼容两种返回格式)
+        if "harvestBtn" in plot and plot["harvestBtn"] and plot["harvestBtn"].get("text") == action:
+            return plot["harvestBtn"]
+        if "btns" in plot:
+            return plot["btns"].get(action)
+        return None
+
+    tasks = []
+    # 关键: 按"地块 → 地块内 actions 顺序"展开, 而不是"action → 所有地块"
+    # 这样同一地块会先翻地, 再收获 (用户诉求: 先翻地 再收获)
+    # 例如: actions=["翻地","收获"], 5 个地块 → [P1翻地, P1收获, P2翻地, P2收获, ...]
+    for p in plots_initial:
+        for action in actions:
+            if plot_has_action(p, action):
+                tasks.append((p, action))
+    log(f"\n[+] 待执行任务: {len(tasks)} 个 (地块 × 动作, 按'先翻地再收获'顺序)")
+    for p, a in tasks:
+        log(f"  地块{p['plotNo']} → {a}")
+
+    if not tasks:
         if len(plots_initial) > 0:
             states = {}
             for p in plots_initial:
                 states[p["state"]] = states.get(p["state"], 0) + 1
-            log(f"  无可收获地块 (抓到 {len(plots_initial)} 个, state 分布: {states}), 等菜熟")
+            log(f"  无可执行任务 (抓到 {len(plots_initial)} 个, state 分布: {states}), 等菜熟")
         else:
             log(f"  ⚠ 抓地块返回 ok 但 plots=[], 页面可能未渲染完或选择器漂移")
         log("  退出")
         cdp.close()
         return 0
 
-    # ===== 逐个点击 + 失败重试 =====
+    # ===== 逐任务执行: 每地块按 action 顺序, 失败重试 =====
     summary = []
-    for p in harvestable:
+    for p, action in tasks:
         plot_no = p["plotNo"]
-        btn_text = p["harvestBtn"]["text"]
+        # 用当前最新的地块数据, 避免上一步改 fingerprint 后还在用旧的
+        cur_plot = p
         attempts = []
         for attempt in range(1, MAX_RETRY + 1):
-            log(f"\n[地块 {plot_no}] 第 {attempt}/{MAX_RETRY} 次尝试 (按钮='{btn_text}')")
+            btn_text = action
+            log(f"\n[地块 {plot_no}] 第 {attempt}/{MAX_RETRY} 次尝试 (动作='{btn_text}')")
             t0 = time.time()
-            # 锁屏态用 DOM 派发 click (绕过 OS 输入层拦截)
             pos = dispatch_click_at(cdp, plot_no, btn_text)
             dt = round((time.time() - t0) * 1000, 1)
 
             if not pos.get("ok"):
                 log(f"  ✗ 派发失败: {pos.get('reason')} (耗时 {dt}ms)")
-                attempts.append({"n": attempt, "ok": False,
+                attempts.append({"n": attempt, "ok": False, "action": action,
                                  "reason": pos.get("reason", "未知"),
                                  "elapsed_ms": dt})
-                # 等一会再重抓
                 time.sleep(RETRY_GAP)
                 continue
 
             log(f"  ✓ 已派发 click  plotNo={pos['plotNo']}  按钮='{pos['buttonText']}'  "
                 f"({dt}ms)")
 
-            # DIAG: 派发后立刻抓一次按钮状态, 区分是 click 没生效 还是 sleep 0.6 后状态没刷新
+            # DIAG: 派发后立刻抓一次按钮状态
             try:
                 snap = js(cdp, r"""
 (() => {
@@ -354,22 +394,21 @@ def main():
     ok: true,
     sameTextCount: sameText.length,
     disabledCount: sameText.filter(b => b.hasAttribute('disabled')).length,
-    firstBtnCls: sameText[0] ? (sameText[0].getAttribute('class') || '').slice(0, 60) : null,
   };
 })()
 """)
                 if snap and snap.get("ok"):
-                    log(f"  [DIAG] 派发后即时: 同名按钮={snap['sameTextCount']} disabled={snap['disabledCount']}  cls={snap.get('firstBtnCls')!r}")
+                    log(f"  [DIAG] 派发后即时: 同名按钮={snap['sameTextCount']} disabled={snap['disabledCount']}")
             except Exception as e:
                 log(f"  [DIAG] 即时抓取失败: {e}")
 
             if DRY_RUN:
                 log(f"  → [DRY-RUN] 跳过真实派发, 仅记录")
-                attempts.append({"n": attempt, "ok": True, "reason": "dry-run", "elapsed_ms": dt})
+                attempts.append({"n": attempt, "ok": True, "action": action,
+                                 "reason": "dry-run", "elapsed_ms": dt})
                 break
 
-            # 验证: 重新抓地块,看按钮是否消失
-            # 自旋等按钮消失 (上限 1.5s, 每 200ms 探一次)
+            # 自旋等按钮消失 (上限 1.5s)
             t_h0 = time.time()
             h_poll = 0
             h_gone = False
@@ -384,7 +423,6 @@ def main():
   if (!second) return { ok:false, reason:'no second' };
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
   const re = new RegExp('地块\\s*""" + str(plot_no) + r"""(?!\\d)');
-  // 找 plotBox: 向上找含"地块 plotNo"+含 button 的最近容器
   const allBtns = Array.from(second.querySelectorAll('button'));
   let plotBox = null;
   for (const b of allBtns) {
@@ -397,7 +435,6 @@ def main():
     if (plotBox) break;
   }
   if (!plotBox) return { ok:true, plotGone:true };
-  // 找 harvest 按钮 (按钮文本 = btn_text)
   const btns = Array.from(plotBox.querySelectorAll('button'));
   const hBtn = btns.find(b => norm(b.innerText) === '""" + btn_text + r"""');
   return { ok:true, plotGone:false, hasBtn:!!hBtn, disabled:hBtn ? hBtn.hasAttribute('disabled') : null };
@@ -410,37 +447,35 @@ def main():
             t_h = round((time.time() - t_h0) * 1000, 0)
             log(f"  [DIAG] 等待按钮消失: {'消失' if h_gone else '未消失'} (poll={h_poll} 次, {int(t_h)}ms)")
 
-            verify_expr = FETCH_PLOTS_JS.replace("TARGET_ACTIONS", json.dumps(TARGET_ACTIONS))
-            verify = js(cdp, verify_expr)
+            # 重新抓一次 plots, 更新 cur_plot (下一个 action 决策 + fingerprint 对比)
+            verify = js(cdp, fetch_expr)
             if not verify.get("ok"):
                 log(f"  ⚠ 验证抓取失败: {verify}")
-                attempts.append({"n": attempt, "ok": False,
+                attempts.append({"n": attempt, "ok": False, "action": action,
                                  "reason": "验证抓取失败"})
                 continue
             new_plot = next((x for x in verify["plots"] if x["plotNo"] == plot_no), None)
-            # DIAG: 派发前后指纹对比
             if new_plot:
-                log(f"  [DIAG] 派发前 fp={p['fingerprint'][:50]!r}")
-                log(f"  [DIAG] 派发后 fp={new_plot['fingerprint'][:50]!r}  same={new_plot['fingerprint']==p['fingerprint']}")
+                log(f"  [DIAG] 派发前 fp={cur_plot['fingerprint'][:50]!r}")
+                log(f"  [DIAG] 派发后 fp={new_plot['fingerprint'][:50]!r}  same={new_plot['fingerprint']==cur_plot['fingerprint']}")
+                cur_plot = new_plot
             if not new_plot:
-                log(f"  ⚠ 地块 {plot_no} 已不在(可能收获成功已被移除)")
-                attempts.append({"n": attempt, "ok": True,
-                                 "reason": "plot gone (可能已收获)"})
+                log(f"  ⚠ 地块 {plot_no} 已不在(可能动作已完成)")
+                attempts.append({"n": attempt, "ok": True, "action": action,
+                                 "reason": "plot gone"})
                 break
-            still_has_btn = new_plot["harvestBtn"] and not new_plot["harvestBtn"]["disabled"]
-            new_fp = new_plot["fingerprint"]
-            old_fp = p["fingerprint"]
-            if not still_has_btn or new_fp != old_fp:
-                log(f"  ✓ 地块 {plot_no} 状态已变化(fingerprint 改变或按钮消失)")
-                attempts.append({"n": attempt, "ok": True,
+            still_has_btn = plot_has_action(new_plot, btn_text)
+            if not still_has_btn:
+                log(f"  ✓ 地块 {plot_no} 动作 '{btn_text}' 已生效 (按钮消失)")
+                attempts.append({"n": attempt, "ok": True, "action": action,
                                  "reason": "state changed"})
                 break
             else:
-                log(f"  ⚠ 地块 {plot_no} 状态未变,可能点击未生效")
-                attempts.append({"n": attempt, "ok": False,
+                log(f"  ⚠ 地块 {plot_no} 按钮 '{btn_text}' 还在, 可能点击未生效")
+                attempts.append({"n": attempt, "ok": False, "action": action,
                                  "reason": "state unchanged after click"})
                 time.sleep(RETRY_GAP)
-        summary.append({"plotNo": plot_no, "btnText": btn_text,
+        summary.append({"plotNo": plot_no, "action": action,
                         "attempts": attempts,
                         "success": any(a["ok"] for a in attempts)})
 
@@ -453,7 +488,7 @@ def main():
     log(f"  失败: {fail}")
     for s in summary:
         ok = "✓" if s["success"] else "✗"
-        log(f"  {ok} 地块{s['plotNo']} (按钮='{s['btnText']}') "
+        log(f"  {ok} 地块{s['plotNo']} (动作='{s['action']}') "
             f"尝试 {len(s['attempts'])} 次")
 
     cdp.close()
@@ -463,8 +498,8 @@ def main():
 if __name__ == "__main__":
     # CLI:
     #   --real           真正派发点击 (默认 dry-run)
-    #   --action A,B,C   处理哪些动作, 默认"收获"
-    args = ["--real"]
+    #   --action A,B,C   处理哪些动作, 默认"翻地,收获" (同一地块先翻地再收获)
+    args = sys.argv[1:]
     if "--real" in args:
         DRY_RUN = False
         args.remove("--real")
@@ -475,4 +510,5 @@ if __name__ == "__main__":
             args = args[:i] + args[i+2:]
     # 收菜不决定下次间隔, 始终 30 分钟
     print(f"[+] NEXT_INTERVAL={30*60}  (收菜固定 30 分钟)")
+    print(f"[+] TARGET_ACTIONS={TARGET_ACTIONS!r}  DRY_RUN={DRY_RUN}")
     sys.exit(main())
