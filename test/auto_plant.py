@@ -83,14 +83,31 @@ class CDPClient:
 
 
 def get_target():
+    # 探测 CDP 端口是否在监听 (锁屏后 Edge 可能被杀/睡眠, 端口没了)
+    try:
+        with urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json/version", timeout=3) as r:
+            ver = json.loads(r.read().decode())
+            print(f"[DIAG] CDP 端口 {DEBUG_PORT} 存活, Browser={ver.get('Browser','')[:60]!r}")
+    except Exception as e:
+        print(f"[DIAG] ✗ CDP 端口 {DEBUG_PORT} 不通: {type(e).__name__}: {e}")
+        print(f"[DIAG]   → 锁屏/睡眠可能让 Edge 退到后台被挂起, 需解锁后由 scheduler 重新拉起")
+        raise
     with urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json", timeout=5) as r:
         ts = json.loads(r.read().decode())
-    for t in ts:
-        if t.get("type") == "page" and "duanwuqiufenmao" in t.get("url", ""):
-            return t
-    for t in ts:
-        if t.get("type") == "page": return t
-    raise RuntimeError("no page")
+    farm_tab = [t for t in ts if t.get("type") == "page" and "duanwuqiufenmao" in t.get("url", "")]
+    all_tabs = [t for t in ts if t.get("type") == "page"]
+    print(f"[DIAG] tabs: 农场={len(farm_tab)} 总 page={len(all_tabs)}")
+    for t in all_tabs[:5]:
+        print(f"[DIAG]   - {t.get('url','')[:80]!r}  title={t.get('title','')[:30]!r}")
+    if not farm_tab:
+        if not all_tabs:
+            print(f"[DIAG] ✗ 没有任何 page tab, 锁屏后 Edge 可能被杀")
+        else:
+            print(f"[DIAG] ✗ 农场 tab 不在, 当前打开: {[t.get('url','')[:40] for t in all_tabs]}")
+        raise RuntimeError("no farm page tab")
+    target = farm_tab[0]
+    print(f"[DIAG] ✓ 锁定 tab: {target.get('url','')[:80]!r}  ws={'YES' if target.get('webSocketDebuggerUrl') else 'NO'}")
+    return target
 
 
 def js(cdp, expr):
@@ -222,18 +239,16 @@ FETCH_PLOTS_JS = r"""
   // 统一去零宽字符 + trim
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
-  // 不依赖任何 hash. 策略:
-  //   1) 找所有 button 文本 = "种植"
-  //   2) 从 button 向上找最近的容器: 含"地块N"文本 + 含 button
-  //   3) plotNo 从容器 innerText 抓 "地块N"
-  const plantBtns = Array.from(second.querySelectorAll('button'))
-    .filter(b => norm(b.innerText) === '种植');
+  // 改: 不再只找"种植"按钮, 而是遍历所有含"地块N"文本的容器
+  // 原因: 当所有地块都种了菜 (在长菠萝), 根本没有"种植"按钮, 老逻辑会返回 0 个
+  // 改后: 任何状态的地块都会被收录, 状态通过 className (empty/ripe/care/success) 判定
+
+  // 策略: 从所有 button 出发, 向上找含"地块N"且含 button 的容器 (plotBox)
+  const allBtns = Array.from(second.querySelectorAll('button'));
   const seen = new Set();
   const plots = [];
-  for (const btn of plantBtns) {
-    if (btn.hasAttribute('disabled')) continue;
 
-    // 找 plotBox: 向上找同时含"地块N"和 button 的最近容器
+  for (const btn of allBtns) {
     let plotBox = null;
     let el = btn;
     for (let i = 0; i < 8 && el && second.contains(el); i++) {
@@ -246,7 +261,6 @@ FETCH_PLOTS_JS = r"""
     }
     if (!plotBox) continue;
 
-    // 从 plotBox 抓 plotNo (取最小数字, 避免 "地块N：地块N" 重复)
     const boxText = norm(plotBox.innerText || '');
     const m = boxText.match(/地块\s*(\d+)/);
     if (!m) continue;
@@ -255,20 +269,33 @@ FETCH_PLOTS_JS = r"""
     seen.add(plotNo);
 
     const cls = (plotBox.className || '').split(/\s+/);
-    // 状态文本优先取"地块N：xxx"这种, 没有就用"地块 N"作为标识
+    const state = cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?';
+    const isEmpty = cls.includes('empty') || /空地/.test(boxText);
+
+    // 收集这个地块的所有按钮 (按文本分类)
+    const btnsInBox = Array.from(plotBox.querySelectorAll('button'));
+    const btnInfo = {};
+    for (const b of btnsInBox) {
+      const t = norm(b.innerText);
+      if (!t) continue;
+      if (!btnInfo[t]) btnInfo[t] = { cls: (b.getAttribute('class')||'').slice(0, 60), disabled: b.hasAttribute('disabled') };
+    }
+
+    // 状态文本
     let status = '';
     for (const e of plotBox.querySelectorAll('*')) {
       const t = norm(e.innerText || '');
       if (/地块\s*\d+[：:]\s*\S/.test(t) && e.children.length <= 1) { status = t; break; }
     }
     if (!status) status = `地块 ${plotNo}`;
-    const isEmpty = cls.includes('empty') || /空地/.test(status);
+
     plots.push({
       plotNo,
-      state: cls.find(c => ['empty','ripe','care','success','danger'].includes(c)) || '?',
+      state,
       isEmpty,
       status,
-      plantBtn: { cls: btn.getAttribute('class') || '' },
+      btns: btnInfo,  // {"种植": {...}, "收获": {...}, "浇水": {...}, ...}
+      plantBtn: btnInfo['种植'] || null,
     });
   }
   plots.sort((a, b) => a.plotNo - b.plotNo);
@@ -732,13 +759,44 @@ def main():
         log(f"  地块{p['plotNo']} state={p['state']:6s} isEmpty={p['isEmpty']}  "
             f"种植={'有' if p['plantBtn'] else '无':3s}  status={p['status'][:50]!r}")
 
+    # DIAG: 打印所有地块 className 前 60 字, 帮助看锁屏后页面是不是变了
+    diag_expr = r"""
+(() => {
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok:false, reason:'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev && prev.children[1];
+  if (!second) return { ok:false, reason:'no second' };
+  const plots = Array.from(second.children).slice(0, 6).map(el => ({
+    tag: el.tagName,
+    cls: (el.getAttribute('class') || '').slice(0, 80),
+    text: (el.innerText || '').replace(/\s+/g, ' ').slice(0, 60),
+  }));
+  return { ok:true, plots, visibility: getComputedStyle(second).visibility, display: getComputedStyle(second).display };
+})()
+"""
+    try:
+        diag = js(cdp, diag_expr)
+        if diag and diag.get("ok"):
+            log(f"[DIAG] 地块容器 display={diag.get('display')} visibility={diag.get('visibility')}")
+            for i, p in enumerate(diag.get("plots", [])):
+                log(f"[DIAG]   [{i}] <{p['tag']}> cls={p['cls']!r}  text={p['text']!r}")
+    except Exception as e:
+        log(f"[DIAG] 容器探测失败: {e}")
+
     # 2) 筛选可种的地块(empty + 有"种植"按钮)
     to_plant = [p for p in plots_res["plots"] if p["isEmpty"] and p["plantBtn"]]
     if ONLY_PLOT is not None:
         to_plant = [p for p in to_plant if p["plotNo"] == ONLY_PLOT]
     log(f"\n[+] 需种菜地块: {len(to_plant)} 个 {[p['plotNo'] for p in to_plant]}")
     if not to_plant:
-        log("  没有空地块, 退出")
+        # 区分两种 0:
+        #   A) 抓到了 N 个地块, 但没一个 isEmpty → 地上都有菜, 等菜熟
+        #   B) 一个地块都没抓到 → 页面 DOM 还没加载好, 或选择器漂移
+        if len(plots_res["plots"]) > 0:
+            log(f"  没有空地块 (抓到 {len(plots_res['plots'])} 个, 但没一个 isEmpty=True), 退出")
+        else:
+            log(f"  ⚠ 没抓到任何地块, 页面可能未渲染完或选择器漂移 (检查上方 [DIAG] 容器探测)")
         # 没种菜, 默认 30 分钟后再启动
         nxt = DEFAULT_NEXT_INTERVAL
         log(f"[+] NEXT_INTERVAL={nxt}  (没空地块, 下次 {nxt/60:.0f} 分钟后启动)")
@@ -1002,11 +1060,24 @@ def main():
                     summary.append({"plotNo": plot_no, "ok": False, "stage": "B-pickup",
                                     "reason": str(e)})
                     break
-            # 强制休眠 2s, 等 Vue 处理 click + 弹窗关闭动画 + API 响应
-            log(f"  → 强制休眠 2s, 等 Vue 关闭弹窗...")
-            time.sleep(2.0)
+            # 自旋等弹窗关闭, 每 150ms 探一次, 最多 3s (快于固定 2s sleep, 又能保证真关掉)
+            log(f"  → 自旋等弹窗关闭 (每 150ms 探一次, 上限 3s)...")
+            t_wait0 = time.time()
+            dialog_closed = False
+            poll_count = 0
+            while time.time() - t_wait0 < 3.0:
+                poll_count += 1
+                if not dialog_real_open():
+                    dialog_closed = True
+                    break
+                time.sleep(0.15)
+            t_wait = round((time.time() - t_wait0) * 1000, 0)
+            if dialog_closed:
+                log(f"  ✓ 弹窗已消失 (poll={poll_count} 次, {int(t_wait)}ms)")
+            else:
+                log(f"  ⚠ 3s 内弹窗仍未消失 (poll={poll_count} 次, {int(t_wait)}ms)")
             # 验证: 弹窗是否消失(说明点中了)
-            still_open = dialog_real_open()
+            still_open = not dialog_closed
             if not still_open:
                 log(f"  ✓ 弹窗已消失, 种菜成功")
                 ok_seed = True
@@ -1147,30 +1218,37 @@ def main():
                                     "reason": "使用按钮派发失败"})
                     break
 
-                # C5: 等 2s + 验证弹窗消失(说明道具被用掉了)
-                time.sleep(2)
-                verify_expr = r"""
-                (() => {
-                  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-                  // 找真弹窗
-                  const allOverlays = document.querySelectorAll('div.el-overlay');
-                  for (const ov of allOverlays) {
-                    const d = ov.querySelector('div.el-dialog');
-                    if (!d) continue;
-                    const r = d.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
-                      // 真弹窗还在
-                      return { gone: false, texts: Array.from(d.querySelectorAll('span,div,p')).slice(0, 5).map(e => norm(e.innerText).slice(0, 30)) };
-                    }
-                  }
-                  return { gone: true };
-                })()
-                """
-                verify = js(cdp, verify_expr)
-                if verify.get("gone"):
-                    log(f"  ✓ 道具弹窗已消失, 双倍经验卡使用成功")
+                # C5: 自旋等弹窗消失 (上限 3s)
+                t_c0 = time.time()
+                c_poll = 0
+                c_gone = False
+                while time.time() - t_c0 < 3.0:
+                    c_poll += 1
+                    v = js(cdp, r"""
+(() => {
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+  const allOverlays = document.querySelectorAll('div.el-overlay');
+  for (const ov of allOverlays) {
+    const d = ov.querySelector('div.el-dialog');
+    if (!d) continue;
+    const r = d.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
+      return { gone: false, texts: Array.from(d.querySelectorAll('span,div,p')).slice(0, 5).map(e => norm(e.innerText).slice(0, 30)) };
+    }
+  }
+  return { gone: true };
+})()
+""")
+                    if v and v.get("gone"):
+                        c_gone = True
+                        break
+                    time.sleep(0.15)
+                t_c = round((time.time() - t_c0) * 1000, 0)
+                verify = {"gone": c_gone, "poll": c_poll, "elapsed_ms": t_c}
+                if c_gone:
+                    log(f"  ✓ 道具弹窗已消失, 双倍经验卡使用成功 (poll={c_poll} 次, {int(t_c)}ms)")
                 else:
-                    log(f"  ⚠ 道具弹窗还在, 可能点错或被遮挡")
+                    log(f"  ⚠ 道具弹窗还在, 可能点错或被遮挡 (poll={c_poll} 次, {int(t_c)}ms)")
                     summary.append({"plotNo": plot_no, "ok": False, "stage": "C-verify",
                                     "reason": "弹窗未消失"})
                     break
@@ -1180,9 +1258,11 @@ def main():
     log("[总结]")
     succ = sum(1 for s in summary if s["ok"])
     fail = len(summary) - succ
-    log(f"  成功: {succ}  失败: {fail}")
+    log(f"  成功: {succ}  失败: {fail}  SEED_NAME={SEED_NAME!r}")
+    # DIAG: 把每个地块最终落点全部打印, 一眼看出卡在哪一步
     for s in summary:
-        log(f"  {'✓' if s['ok'] else '✗'} 地块{s['plotNo']}  stage={s.get('stage')}  reason={s.get('reason','-')}")
+        log(f"  {'✓' if s['ok'] else '✗'} 地块{s['plotNo']}  stage={s.get('stage')}  reason={s.get('reason','-')!r}")
+    log(f"[DIAG] 决策: succ={succ} → 查表 NEXT_INTERVAL_BY_SEED[{SEED_NAME!r}]={NEXT_INTERVAL_BY_SEED.get(SEED_NAME, 'MISS→DEFAULT')}  DEFAULT={DEFAULT_NEXT_INTERVAL}")
 
     # 决定下次启动间隔:
     #   本次至少种成功 1 个 → 按 SEED_NAME 查 NEXT_INTERVAL_BY_SEED

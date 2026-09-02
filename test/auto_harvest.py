@@ -74,15 +74,31 @@ class CDPClient:
 
 
 def get_target():
+    # 探测 CDP 端口是否在监听 (锁屏后 Edge 可能被杀/睡眠, 端口没了)
+    try:
+        with urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json/version", timeout=3) as r:
+            ver = json.loads(r.read().decode())
+            print(f"[DIAG] CDP 端口 {DEBUG_PORT} 存活, Browser={ver.get('Browser','')[:60]!r}")
+    except Exception as e:
+        print(f"[DIAG] ✗ CDP 端口 {DEBUG_PORT} 不通: {type(e).__name__}: {e}")
+        print(f"[DIAG]   → 锁屏/睡眠可能让 Edge 退到后台被挂起, 需解锁后由 scheduler 重新拉起")
+        raise
     with urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json", timeout=5) as r:
         ts = json.loads(r.read().decode())
-    for t in ts:
-        if t.get("type") == "page" and "duanwuqiufenmao" in t.get("url", ""):
-            return t
-    for t in ts:
-        if t.get("type") == "page":
-            return t
-    raise RuntimeError("no page")
+    farm_tab = [t for t in ts if t.get("type") == "page" and "duanwuqiufenmao" in t.get("url", "")]
+    all_tabs = [t for t in ts if t.get("type") == "page"]
+    print(f"[DIAG] tabs: 农场={len(farm_tab)} 总 page={len(all_tabs)}")
+    for t in all_tabs[:5]:
+        print(f"[DIAG]   - {t.get('url','')[:80]!r}  title={t.get('title','')[:30]!r}")
+    if not farm_tab:
+        if not all_tabs:
+            print(f"[DIAG] ✗ 没有任何 page tab, 锁屏后 Edge 可能被杀")
+        else:
+            print(f"[DIAG] ✗ 农场 tab 不在, 当前打开: {[t.get('url','')[:40] for t in all_tabs]}")
+        raise RuntimeError("no farm page tab")
+    target = farm_tab[0]
+    print(f"[DIAG] ✓ 锁定 tab: {target.get('url','')[:80]!r}  ws={'YES' if target.get('webSocketDebuggerUrl') else 'NO'}")
+    return target
 
 
 def js(cdp, expr):
@@ -174,8 +190,11 @@ FETCH_PLOTS_JS = r"""
 """
 
 
-# ============== 找 button 坐标 + 点击 ==============
-CLICK_BY_TEXT_JS = r"""
+# ============== 找 button + 派发 click ==============
+# 锁屏状态下 CDP Input.dispatchMouseEvent 会被 OS 丢弃,
+# 必须直接派发 DOM MouseEvent/click/PointerEvent, 绕过 OS 输入层.
+# 兼容: Element UI 监听 click; Vue 监听 pointerdown/up.
+DISPATCH_CLICK_JS = r"""
 ((args) => {
   const { plotNo, buttonText } = args;
   const ad = document.querySelector('.farm-ad-card');
@@ -186,7 +205,7 @@ CLICK_BY_TEXT_JS = r"""
 
   const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
 
-  // 不依赖 hash: 从 button(目标 buttonText) 向上找含"地块 plotNo"的容器
+  // 从 button(目标 buttonText) 向上找含"地块 plotNo"的容器
   const allBtns = Array.from(second.querySelectorAll('button'));
   let targetBtn = null;
   for (const b of allBtns) {
@@ -206,24 +225,25 @@ CLICK_BY_TEXT_JS = r"""
     return { ok: false, reason: `button "${buttonText}" not in plot ${plotNo} (共 ${sameTextCount} 个"${buttonText}"按钮)` };
   }
   if (!document.contains(targetBtn)) return { ok: false, reason: 'button detached' };
+  if (targetBtn.hasAttribute('disabled')) return { ok: false, reason: 'button disabled' };
 
-  // 取坐标
-  const r = targetBtn.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return { ok: false, reason: 'button 0-size' };
-  const x = r.left + r.width / 2;
-  const y = r.top + r.height / 2;
-  if (x <= 0 || y <= 0) return { ok: false, reason: 'button off-screen' };
+  // 派发完整事件序列: mousedown / mouseup / click + pointerdown / pointerup
+  targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, button: 0 }));
+  targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, button: 0 }));
+  targetBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+  targetBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 }));
+  targetBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0 }));
 
   return {
     ok: true, plotNo, buttonText,
-    x, y, w: r.width, h: r.height,
     btnCls: targetBtn.getAttribute('class') || '',
   };
-})({ plotNo: PLOTNO, buttonText: BUTTONTEXT })
+})(CLICKARGS)
 """
 
 
 def click_at(cdp, x, y, button="left"):
+    """保留以备非收菜场景使用; 锁屏态会被 OS 拦截, 收菜请用 dispatch_click_at"""
     cdp.send("Input.dispatchMouseEvent", {
         "type": "mouseMoved", "x": x, "y": y,
         "button": button, "buttons": 0,
@@ -236,6 +256,14 @@ def click_at(cdp, x, y, button="left"):
         "type": "mouseReleased", "x": x, "y": y,
         "button": button, "buttons": 0, "clickCount": 1,
     })
+
+
+def dispatch_click_at(cdp, plot_no, button_text):
+    """DOM 派发 click, 锁屏态可用. 复用 DISPATCH_CLICK_JS 模板."""
+    expr = DISPATCH_CLICK_JS.replace(
+        "CLICKARGS", json.dumps({"plotNo": plot_no, "buttonText": button_text})
+    )
+    return js(cdp, expr)
 
 
 def main():
@@ -273,7 +301,15 @@ def main():
     harvestable = [p for p in plots_initial if p["harvestBtn"] and not p["harvestBtn"]["disabled"]]
     log(f"\n[+] 可收获地块: {len(harvestable)} 个")
     if not harvestable:
-        log("  无可收获地块, 退出")
+        # 区分两种 0: 真没东西成熟 vs 没抓到地块
+        if len(plots_initial) > 0:
+            states = {}
+            for p in plots_initial:
+                states[p["state"]] = states.get(p["state"], 0) + 1
+            log(f"  无可收获地块 (抓到 {len(plots_initial)} 个, state 分布: {states}), 等菜熟")
+        else:
+            log(f"  ⚠ 抓地块返回 ok 但 plots=[], 页面可能未渲染完或选择器漂移")
+        log("  退出")
         cdp.close()
         return 0
 
@@ -285,19 +321,13 @@ def main():
         attempts = []
         for attempt in range(1, MAX_RETRY + 1):
             log(f"\n[地块 {plot_no}] 第 {attempt}/{MAX_RETRY} 次尝试 (按钮='{btn_text}')")
-            # 取最新坐标(每次重新获取,因为 DOM 可能在变)
-            expr = (CLICK_BY_TEXT_JS
-                    .replace("PLOTNO", str(plot_no))
-                    .replace("BUTTONTEXT", json.dumps(btn_text)))
             t0 = time.time()
-            try:
-                pos = js(cdp, expr)
-            except Exception as e:
-                pos = {"ok": False, "reason": f"JS 异常: {e}"}
+            # 锁屏态用 DOM 派发 click (绕过 OS 输入层拦截)
+            pos = dispatch_click_at(cdp, plot_no, btn_text)
             dt = round((time.time() - t0) * 1000, 1)
 
             if not pos.get("ok"):
-                log(f"  ✗ 定位失败: {pos.get('reason')} (耗时 {dt}ms)")
+                log(f"  ✗ 派发失败: {pos.get('reason')} (耗时 {dt}ms)")
                 attempts.append({"n": attempt, "ok": False,
                                  "reason": pos.get("reason", "未知"),
                                  "elapsed_ms": dt})
@@ -305,26 +335,81 @@ def main():
                 time.sleep(RETRY_GAP)
                 continue
 
-            log(f"  ✓ 定位成功  plotNo={pos['plotNo']}  按钮='{pos['buttonText']}'  "
-                f"@({pos['x']:.1f},{pos['y']:.1f})  {pos['w']:.0f}×{pos['h']:.0f}  "
+            log(f"  ✓ 已派发 click  plotNo={pos['plotNo']}  按钮='{pos['buttonText']}'  "
                 f"({dt}ms)")
 
-            # 派发点击(除非 dry-run)
+            # DIAG: 派发后立刻抓一次按钮状态, 区分是 click 没生效 还是 sleep 0.6 后状态没刷新
+            try:
+                snap = js(cdp, r"""
+(() => {
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok:false, reason:'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev && prev.children[1];
+  if (!second) return { ok:false, reason:'no second' };
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+  const allBtns = Array.from(second.querySelectorAll('button'));
+  const sameText = allBtns.filter(b => norm(b.innerText) === '""" + btn_text + r"""');
+  return {
+    ok: true,
+    sameTextCount: sameText.length,
+    disabledCount: sameText.filter(b => b.hasAttribute('disabled')).length,
+    firstBtnCls: sameText[0] ? (sameText[0].getAttribute('class') || '').slice(0, 60) : null,
+  };
+})()
+""")
+                if snap and snap.get("ok"):
+                    log(f"  [DIAG] 派发后即时: 同名按钮={snap['sameTextCount']} disabled={snap['disabledCount']}  cls={snap.get('firstBtnCls')!r}")
+            except Exception as e:
+                log(f"  [DIAG] 即时抓取失败: {e}")
+
             if DRY_RUN:
-                log(f"  → [DRY-RUN] 跳过真实派发, 仅记录坐标")
+                log(f"  → [DRY-RUN] 跳过真实派发, 仅记录")
                 attempts.append({"n": attempt, "ok": True, "reason": "dry-run", "elapsed_ms": dt})
                 break
-            try:
-                click_at(cdp, pos["x"], pos["y"])
-                log(f"  → 已派发 mouseMoved + Pressed + Released")
-            except Exception as e:
-                log(f"  ✗ 派发失败: {e}")
-                attempts.append({"n": attempt, "ok": False,
-                                 "reason": f"派发异常: {e}"})
-                continue
 
             # 验证: 重新抓地块,看按钮是否消失
-            time.sleep(0.6)
+            # 自旋等按钮消失 (上限 1.5s, 每 200ms 探一次)
+            t_h0 = time.time()
+            h_poll = 0
+            h_gone = False
+            while time.time() - t_h0 < 1.5:
+                h_poll += 1
+                snap_v = js(cdp, r"""
+(() => {
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok:false, reason:'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev && prev.children[1];
+  if (!second) return { ok:false, reason:'no second' };
+  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
+  const re = new RegExp('地块\\s*""" + str(plot_no) + r"""(?!\\d)');
+  // 找 plotBox: 向上找含"地块 plotNo"+含 button 的最近容器
+  const allBtns = Array.from(second.querySelectorAll('button'));
+  let plotBox = null;
+  for (const b of allBtns) {
+    let el = b;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      if (re.test(t) && el.querySelectorAll('button').length > 0) { plotBox = el; break; }
+      el = el.parentElement;
+    }
+    if (plotBox) break;
+  }
+  if (!plotBox) return { ok:true, plotGone:true };
+  // 找 harvest 按钮 (按钮文本 = btn_text)
+  const btns = Array.from(plotBox.querySelectorAll('button'));
+  const hBtn = btns.find(b => norm(b.innerText) === '""" + btn_text + r"""');
+  return { ok:true, plotGone:false, hasBtn:!!hBtn, disabled:hBtn ? hBtn.hasAttribute('disabled') : null };
+})()
+""")
+                if snap_v and snap_v.get("ok") and (snap_v.get("plotGone") or not snap_v.get("hasBtn")):
+                    h_gone = True
+                    break
+                time.sleep(0.2)
+            t_h = round((time.time() - t_h0) * 1000, 0)
+            log(f"  [DIAG] 等待按钮消失: {'消失' if h_gone else '未消失'} (poll={h_poll} 次, {int(t_h)}ms)")
+
             verify_expr = FETCH_PLOTS_JS.replace("TARGET_ACTIONS", json.dumps(TARGET_ACTIONS))
             verify = js(cdp, verify_expr)
             if not verify.get("ok"):
@@ -333,6 +418,10 @@ def main():
                                  "reason": "验证抓取失败"})
                 continue
             new_plot = next((x for x in verify["plots"] if x["plotNo"] == plot_no), None)
+            # DIAG: 派发前后指纹对比
+            if new_plot:
+                log(f"  [DIAG] 派发前 fp={p['fingerprint'][:50]!r}")
+                log(f"  [DIAG] 派发后 fp={new_plot['fingerprint'][:50]!r}  same={new_plot['fingerprint']==p['fingerprint']}")
             if not new_plot:
                 log(f"  ⚠ 地块 {plot_no} 已不在(可能收获成功已被移除)")
                 attempts.append({"n": attempt, "ok": True,

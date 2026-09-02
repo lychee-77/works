@@ -59,7 +59,23 @@ def run_script(name, lines, extra_args=None, env=None):
     if not os.path.exists(path):
         log(f"[!] 找不到脚本: {path}", lines)
         return False, ""
-    log(f"=== 开始执行 {name} ===", lines)
+    log(f"=== 开始执行 {name}  (args={extra_args or []}) ===", lines)
+    # DIAG: 启动子进程前先确认 CDP 端口和 Edge 进程
+    port = (env or {}).get("FARM_DEBUG_PORT", str(DEFAULT_DEBUG_PORT))
+    if is_debug_port_up(int(port)):
+        log(f"[DIAG] 启动前 CDP 端口 {port} 存活", lines)
+    else:
+        log(f"[DIAG] ⚠ 启动前 CDP 端口 {port} 不通, 子进程大概率失败", lines)
+    try:
+        import psutil
+        edges = [p for p in psutil.process_iter(['pid','name']) if p.info['name'] and 'msedge' in p.info['name'].lower()]
+        log(f"[DIAG] msedge 进程数={len(edges)}", lines)
+        for p in edges[:3]:
+            log(f"[DIAG]   - pid={p.info['pid']}  name={p.info['name']}", lines)
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"[DIAG] 进程枚举失败: {e}", lines)
     captured = []
     try:
         # 把当前调试端口/用户目录通过环境变量透传给子脚本
@@ -73,6 +89,7 @@ def run_script(name, lines, extra_args=None, env=None):
             text=True, encoding="utf-8", errors="replace", cwd=HERE,
             env=child_env,
         )
+        log(f"[DIAG] {name} 子进程已启动 pid={proc.pid}", lines)
         for stdout_line in iter(proc.stdout.readline, ""):
             if stdout_line:
                 captured.append(stdout_line)
@@ -215,6 +232,21 @@ def main():
         while True:
             cycle += 1
             log(f"\n========== 第 {cycle} 轮 ==========", lines)
+            # DIAG: 轮次开始时, 检查 CDP 端口 + 屏幕是否锁屏
+            if is_debug_port_up(args.port):
+                log(f"[DIAG] 第 {cycle} 轮: CDP 端口 {args.port} 存活", lines)
+            else:
+                log(f"[DIAG] 第 {cycle} 轮: ⚠ CDP 端口 {args.port} 不通, Edge 可能被杀/未起", lines)
+            # 锁屏检测 (PowerShell): session 0 锁屏时 GetForegroundWindow 返回 0
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                hwnd = user32.GetForegroundWindow()
+                locked = (hwnd == 0)
+                log(f"[DIAG] 第 {cycle} 轮: GetForegroundWindow={hwnd}  推测锁屏={locked}", lines)
+            except Exception as e:
+                log(f"[DIAG] 锁屏检测失败: {e}", lines)
             # 收菜 (动作列表由上轮 auto_plant.py 决定)
             if not args.plant_only:
                 # CLI --harvest-args 透传的内容 + 自动注入的 --action
@@ -223,9 +255,6 @@ def main():
                 auto_args = ["--action", ",".join(next_harvest_actions)]
                 harvest_extra = extra_from_cli + auto_args
                 run_script("auto_harvest.py", lines, harvest_extra, env=child_env)
-                # 收完后等几秒, 让 Vue 状态稳定
-                log("等待 3s 让 Vue 状态稳定...", lines)
-                time.sleep(3)
             # 种菜 (auto_plant.py 通过 stdout NEXT_INTERVAL=NNN 决定下次循环间隔)
             this_interval = DEFAULT_NEXT_INTERVAL
             if not args.harvest_only:
@@ -235,8 +264,6 @@ def main():
                 # 解析"下次收菜动作列表"
                 next_harvest_actions = parse_next_harvest_actions(captured)
                 log(f"  📋 下次收菜动作: {next_harvest_actions}", lines)
-                log("等待 3s 让 Vue 状态稳定...", lines)
-                time.sleep(3)
 
             # 等下一轮
             log(f"下一轮在 {this_interval} 秒后 ({this_interval/60:.1f} 分钟)...", lines)
