@@ -27,7 +27,7 @@ try:
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 except Exception:
     pass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DEBUG_PORT = 9222
@@ -266,7 +266,13 @@ def main():
                 log(f"  📋 下次收菜动作: {next_harvest_actions}", lines)
 
             # 等下一轮
-            log(f"下一轮在 {this_interval} 秒后 ({this_interval/60:.1f} 分钟)...", lines)
+            next_time = datetime.now() + timedelta(seconds=this_interval)
+            next_time_str = next_time.strftime("%Y-%m-%d %H:%M:%S")
+            if this_interval >= 3600:
+                dur_str = f"{this_interval/3600:.2f} 小时 ({int(this_interval/60)} 分钟)"
+            else:
+                dur_str = f"{this_interval/60:.1f} 分钟"
+            log(f"下一轮: {next_time_str}  (间隔 {dur_str} = {this_interval} 秒)...", lines)
             time.sleep(this_interval)
     except KeyboardInterrupt:
         log(f"\n[!] 用户中断, 停止调度器 (累计 {cycle} 轮)", lines)

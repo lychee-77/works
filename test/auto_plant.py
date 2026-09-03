@@ -10,8 +10,8 @@ auto_plant.py
   5) 失败重试: 节点不存在 / 坐标 0 / 派发异常 → 重新抓弹窗, 重试
 
 用法:
-  python auto_plant.py                  # dry-run, 只定位不点
-  python auto_plant.py --real           # 真正点击
+  python auto_plant.py                  # 默认 REAL, 真正点击
+  python auto_plant.py --dry-run        # 只定位不点
   python auto_plant.py --seed 胡萝卜   # 改种别的, 默认胡萝卜
   python auto_plant.py --plot 1         # 只处理地块 1
 """
@@ -44,13 +44,19 @@ SEED_BY_HOUR: Dict[tuple, str] = {
     (0, 1): "菠萝",  # 0:00–0:59 种菠萝 (就这一次), 其他时段种胡萝卜
 }
 
-# 种子的下次启动间隔(秒): 走完一次种菜后, 等多久再种下一轮
-# 没列出的种子用默认 30 分钟 (1800s)
-NEXT_INTERVAL_BY_SEED: Dict[str, int] = {
-    "菠萝": 405 * 60,  # 6 小时 45 分 = 405 分钟 = 24300 秒
-    # "胡萝卜": 30 * 60,  # 默认 1800, 不写也行
+# 各品种的成熟生长周期(秒)
+# 菠萝只在 0:00–0:59 一次性种下后, 需要等它生长完才能再种/收
+# 之所以"只在那一分钟种", 就是因为它周期长 (6h45m)
+# 胡萝卜周期短 (默认 5 分钟), 可以 30 分钟后再扫一次
+CROP_GROW_TIME: Dict[str, int] = {
+    "菠萝":   405 * 60,   # 6 小时 45 分
+    "胡萝卜":   5 * 60,   # 5 分钟
+    "白菜":    30 * 60,
+    "小麦":    30 * 60,
+    "玉米":    60 * 60,
+    "土豆":    60 * 60,
 }
-DEFAULT_NEXT_INTERVAL = 30 * 60  # 30 分钟
+DEFAULT_GROW_TIME = 30 * 60  # 30 分钟 (未列出的菜用这个)
 
 
 # 强制 stdout/stderr 用 UTF-8 (Windows 默认 GBK, 中文 + 特殊字符会乱码/崩)
@@ -789,20 +795,8 @@ def main():
     if ONLY_PLOT is not None:
         to_plant = [p for p in to_plant if p["plotNo"] == ONLY_PLOT]
     log(f"\n[+] 需种菜地块: {len(to_plant)} 个 {[p['plotNo'] for p in to_plant]}")
-    if not to_plant:
-        # 区分两种 0:
-        #   A) 抓到了 N 个地块, 但没一个 isEmpty → 地上都有菜, 等菜熟
-        #   B) 一个地块都没抓到 → 页面 DOM 还没加载好, 或选择器漂移
-        if len(plots_res["plots"]) > 0:
-            log(f"  没有空地块 (抓到 {len(plots_res['plots'])} 个, 但没一个 isEmpty=True), 退出")
-        else:
-            log(f"  ⚠ 没抓到任何地块, 页面可能未渲染完或选择器漂移 (检查上方 [DIAG] 容器探测)")
-        # 没种菜, 默认 30 分钟后再启动
-        nxt = DEFAULT_NEXT_INTERVAL
-        log(f"[+] NEXT_INTERVAL={nxt}  (没空地块, 下次 {nxt/60:.0f} 分钟后启动)")
-        # 没种出菜, 下次收菜动作也用默认
-        log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
-        cdp.close(); return 0
+    # 注意: 即便 to_plant 为空, 也继续走主循环 (向 summary 累加空记录)
+    # 底部会有"轮后复查"统一算 NEXT_INTERVAL, 这里不再提前 return, 避免 NameError
 
     summary = []
     for p in to_plant:
@@ -1253,30 +1247,201 @@ def main():
                                     "reason": "弹窗未消失"})
                     break
 
+    # ===== 种完后再检查一遍地, 按所有地块里菜种的最长生长周期决定下次启动间隔 =====
+    # 菠萝只种一轮; 但地里可能还有上轮没被翻掉的成熟菜/枯草, 一并算进去 → 取 max
+    log("\n[轮后复查] 重新抓地块, 求 NEXT_INTERVAL = max(每个有作物地块的生长周期)...")
+    time.sleep(1.0)  # 让 UI 渲染稳定
+    recheck = js(cdp, FETCH_PLOTS_JS)
+    max_grow = 0
+    max_crop = "?"
+    max_plot = None
+    if recheck and recheck.get("ok") and recheck.get("plots"):
+        KNOWN_CROPS = ["菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+        for p in recheck["plots"]:
+            # 取 crop: 优先走 boxText 匹配已知菜名 (复用同文件前面抓 plot 的逻辑)
+            crop = ""
+            box = (p.get("status") or "") + " " + (p.get("fingerprint") or "")
+            # 优先: 通过 plotBox 的 norm 文本找纯文本叶节点
+            # 简化: 这里直接用 status 字符串包含判断
+            for c in KNOWN_CROPS:
+                if c in box:
+                    crop = c; break
+            if not crop: continue
+            # 跳过空地块
+            if p.get("isEmpty"): continue
+            grow = CROP_GROW_TIME.get(crop, DEFAULT_GROW_TIME)
+            log(f"  地块{p['plotNo']}  crop={crop!r}  grow={grow}s ({grow/60:.1f} 分)")
+            if grow > max_grow:
+                max_grow = grow
+                max_crop = crop
+                max_plot = p["plotNo"]
+        log(f"  → 最长作物: 地块{max_plot} 的 {max_crop!r}, 周期={max_grow}s ({max_grow/60:.1f} 分)")
+    else:
+        log(f"  ⚠ 轮后复查失败: {recheck}, 退回用默认 {DEFAULT_GROW_TIME}s")
+
+    # ===== 追加抓剩余时间 (前端显示 "剩余 X 分 Y 秒") =====
+    # 关键: 用地里实际的剩余倒计时, 而不是写死的 CROP_GROW_TIME
+    # 因为地里作物可能已经种了一段时间, 实际剩余时间 < 生长周期
+    REFETCH_PLOT_REMAIN_JS = r"""
+(() => {
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok: false, reason: 'no ad' };
+  const prev = ad.previousElementSibling;
+  const second = prev && prev.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
+  // 抹掉零宽字符 + 全角空格等
+  const norm = (s) => (s || '')
+    .replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '')
+    .replace(/\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // 去掉中英文括号等让正则更稳
+  const sanitize = (s) => s.replace(/[()（）【】\[\]]/g, ' ').replace(/\s+/g, ' ').trim();
+
+  const allBtns = Array.from(second.querySelectorAll('button'));
+  const seen = new Set();
+  const out = [];
+
+  // 通用: 任意字符串里挑出最大"剩余"时间 (秒)
+  function pickRemainSec(text) {
+    if (!text) return 0;
+    const candidates = [];
+    const t = sanitize(norm(text));
+    // 1) 剩余 X 小时 Y 分 Z 秒
+    let m;
+    const re1 = /剩余\s*(\d+)\s*(?:小时|时)\s*(\d+)\s*分(?:\s*(\d+)\s*秒)?/g;
+    while ((m = re1.exec(t)) !== null) {
+      candidates.push((+m[1])*3600 + (+m[2])*60 + (+(m[3]||0)));
+    }
+    // 2) 剩余 X 分 Y 秒 / 剩余 X 分
+    const re2 = /剩余\s*(\d+)\s*分(?:\s*(\d+)\s*秒)?/g;
+    while ((m = re2.exec(t)) !== null) {
+      candidates.push((+m[1])*60 + (+(m[2]||0)));
+    }
+    // 3) 剩余 X 秒
+    const re3 = /剩余\s*(\d+)\s*秒/g;
+    while ((m = re3.exec(t)) !== null) {
+      candidates.push((+m[1]));
+    }
+    // 4) 剩余 HH:MM:SS / 剩余 MM:SS
+    const re4 = /剩余\s*(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/g;
+    while ((m = re4.exec(t)) !== null) {
+      candidates.push((+m[1])*3600 + (+m[2])*60 + (+(m[3]||0)));
+    }
+    return candidates.length ? Math.max(...candidates) : 0;
+  }
+
+  for (const btn of allBtns) {
+    let plotBox = null, el = btn;
+    for (let i = 0; i < 8 && el && second.contains(el); i++) {
+      const txt = norm(el.innerText || '');
+      if (/地块\s*\d+/.test(txt) && el.querySelectorAll('button').length > 0) {
+        plotBox = el; break;
+      }
+      el = el.parentElement;
+    }
+    if (!plotBox) continue;
+    const boxText = norm(plotBox.innerText || '');
+    const m = boxText.match(/地块\s*(\d+)/);
+    if (!m) continue;
+    const plotNo = parseInt(m[1]);
+    if (seen.has(plotNo)) continue;
+    seen.add(plotNo);
+
+    // 1) 先看 plotBox 全文 (整段 innerText 已被 norm 拼接过, 包含所有子节点文本)
+    let sec = pickRemainSec(boxText);
+    // 2) 兜底: 遍历 plotBox 的所有子节点文本, 取所有命中里的最大秒数
+    //    (有些页面用单个 span 只显示 "剩余 9 分", 不会含 "秒"; 这里一起算)
+    let leafHits = [];
+    for (const e of plotBox.querySelectorAll('*')) {
+      const t = norm(e.innerText || '');
+      if (!t) continue;
+      const s = pickRemainSec(t);
+      if (s > 0) leafHits.push({ text: t.length > 30 ? t.slice(0, 30) + '…' : t, sec: s });
+    }
+    if (leafHits.length === 0 && sec === 0) {
+      out.push({ plotNo, sec: 0, hits: [] });
+    } else {
+      // 取 plotBox 全文算出的与所有 leaf hits 里的最大值 (整段文本可能漏掉某些分段)
+      let best = sec;
+      const bestHit = sec > 0 ? [{ text: boxText.length > 30 ? boxText.slice(0,30)+'…' : boxText, sec }] : [];
+      for (const h of leafHits) {
+        if (h.sec > best) best = h.sec;
+      }
+      // 重新合成 hits: 全文的 + 节点的
+      const hits = [...bestHit, ...leafHits].filter((v, i, a) => a.findIndex(x => x.sec === v.sec && x.text === v.text) === i);
+      out.push({ plotNo, sec: best, hits });
+    }
+  }
+  out.sort((a, b) => a.plotNo - b.plotNo);
+  return { ok: true, plots: out };
+})()
+"""
+    log("\n[轮后复查] 重新抓地块, 求 NEXT_INTERVAL = max(地里剩余时间)...")
+    time.sleep(1.0)  # 让 UI 渲染稳定
+    recheck = js(cdp, FETCH_PLOTS_JS)
+    remain_res = js(cdp, REFETCH_PLOT_REMAIN_JS)
+    max_remain = 0  # 单位: 秒 (地里实际剩余时间)
+    max_crop = "?"
+    max_plot = None
+    max_source = "?"
+    # remain 按 plotNo 索引
+    remain_by_plot = {}
+    if remain_res and remain_res.get("ok"):
+        for rp in remain_res.get("plots", []):
+            remain_by_plot[rp["plotNo"]] = {"sec": rp.get("sec", 0), "hits": rp.get("hits", [])}
+    KNOWN_CROPS = ["菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+    if recheck and recheck.get("ok") and recheck.get("plots"):
+        for p in recheck["plots"]:
+            # 取 crop
+            crop = ""
+            box = (p.get("status") or "") + " " + (p.get("fingerprint") or "")
+            for c in KNOWN_CROPS:
+                if c in box:
+                    crop = c; break
+            if not crop: continue
+            if p.get("isEmpty"): continue
+            # 取该地块的 UI 倒计时
+            rdata = remain_by_plot.get(p["plotNo"], {"sec": 0, "hits": []})
+            plot_remain = rdata["sec"]
+            hits = rdata["hits"]
+            # 决策:
+            #   1) 有 UI 倒计时 → 用 UI 的 (地里实况)
+            #   2) 没 UI 倒计时 → fallback 到 CROP_GROW_TIME
+            if plot_remain > 0:
+                grow = plot_remain
+                hit_summary = "; ".join(f"{h['text']}={h['sec']}s" for h in hits[:3])
+                source = f"UI 倒计时 {grow}s ({hit_summary})"
+            else:
+                grow = CROP_GROW_TIME.get(crop, DEFAULT_GROW_TIME)
+                source = f"配置 {grow}s"
+            log(f"  地块{p['plotNo']}  crop={crop!r}  剩余={grow}s ({grow/60:.1f} 分)  [{source}]")
+            if grow > max_remain:
+                max_remain = grow
+                max_crop = crop
+                max_plot = p["plotNo"]
+                max_source = source
+        if max_plot is not None:
+            log(f"  → 最长剩余: 地块{max_plot} 的 {max_crop!r}, {max_source}, ={max_remain}s ({max_remain/60:.1f} 分)")
+    else:
+        log(f"  ⚠ 轮后复查失败: {recheck}, 退回用默认 {DEFAULT_GROW_TIME}s")
+
     # ===== 总结 =====
     log("\n" + "=" * 60)
     log("[总结]")
     succ = sum(1 for s in summary if s["ok"])
     fail = len(summary) - succ
     log(f"  成功: {succ}  失败: {fail}  SEED_NAME={SEED_NAME!r}")
-    # DIAG: 把每个地块最终落点全部打印, 一眼看出卡在哪一步
     for s in summary:
         log(f"  {'✓' if s['ok'] else '✗'} 地块{s['plotNo']}  stage={s.get('stage')}  reason={s.get('reason','-')!r}")
-    log(f"[DIAG] 决策: succ={succ} → 查表 NEXT_INTERVAL_BY_SEED[{SEED_NAME!r}]={NEXT_INTERVAL_BY_SEED.get(SEED_NAME, 'MISS→DEFAULT')}  DEFAULT={DEFAULT_NEXT_INTERVAL}")
 
-    # 决定下次启动间隔:
-    #   本次至少种成功 1 个 → 按 SEED_NAME 查 NEXT_INTERVAL_BY_SEED
-    #   本次没种出菜 (没空地 / 全失败) → 默认 30 分钟
-    if succ > 0:
-        nxt = NEXT_INTERVAL_BY_SEED.get(SEED_NAME, DEFAULT_NEXT_INTERVAL)
-    else:
-        nxt = DEFAULT_NEXT_INTERVAL
-    log(f"[+] NEXT_INTERVAL={nxt}  (种 {SEED_NAME} {'成功 '+str(succ)+' 块' if succ>0 else '本次没种出菜'}, 下次 {nxt/60:.0f} 分钟后启动)")
+    # 下次启动间隔 = 复查到的地里实际剩余时间 (单位: 秒)
+    # 没抓到任何剩余时间时回落默认
+    nxt = max_remain if max_remain > 0 else DEFAULT_GROW_TIME
+    log(f"[+] NEXT_INTERVAL={nxt}  (地里最长剩余={max_crop!r}, 下次 {nxt/60:.1f} 分钟 = {nxt/3600:.2f} 小时后启动)")
 
-    # 决定下次收菜要处理的动作: 仅本次种菠萝时, 加"道具"动作
-    # (scheduler.py 会读这行, 加到下次 auto_harvest.py 的 --action 里)
+    # 下次收菜动作: 仅本次种菠萝时, 加"道具"动作
     if succ > 0 and SEED_NAME == "菠萝":
-        # 收菜时如果页面有"道具"按钮就派发点击; 没有就跳过(不会硬找)
         log(f"[+] NEXT_HARVEST_ACTIONS=道具,翻地,收获  (种了菠萝, 下次收菜顺带按道具按钮)")
     else:
         log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
@@ -1286,9 +1451,9 @@ def main():
 
 
 if __name__ == "__main__":
-    args = ["--real"]
-    if "--real" in args:
-        DRY_RUN = False; args.remove("--real")
+    args = sys.argv[1:]
+    if "--dry-run" in args:
+        DRY_RUN = True; args.remove("--dry-run")
     explicit_seed = None  # CLI 显式指定时, 跳过按时间选种子
     if "--seed" in args:
         i = args.index("--seed")
