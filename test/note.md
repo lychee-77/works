@@ -22,3 +22,24 @@ python scheduler.py
 ```
 python scheduler.py --port 9333 --profile edge-farm-profile-2
 ```
+
+## 其他功能
+### 爬塔
+climbing_town.py: 先去背包使用还魂丹，还魂丹使用个数REVIVE_TIMES = 0可以设置，使用后选择层数TARGET_FLOOR = 48开始爬塔，
+循环对战5次REPEAT_TIMES = 5+使用小瓶经验水，大瓶经验水自行修改参数
+
+执行以下命令开启脚本：
+```
+python climbing_town.py
+```
+
+### 使用灵核碎片
+use_ling_ker.py: 点击背包的灵核，使用所有灵核碎片，
+
+执行以下命令开启脚本：
+```
+python use_ling_ker.py
+```
+
+
+
