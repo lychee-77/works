@@ -26,10 +26,8 @@ ENV/
 Thumbs.db
 *.tmp
 
-# --- 你的个人/隐私数据 ---
-edge-farm-profile/
-edge-farm-profile-2/
-edge-farm-profile-3/
+# 忽略所有 edge-farm-profile 前缀的目录
+edge-farm-profile*/
 
 # --- 构建与打包目录 (如果有) ---
 build/
