@@ -168,6 +168,13 @@ def launch_edge(lines, port, user_data_dir):
         "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
+        # 屏幕缩放 50%
+        "--force-device-scale-factor=0.5",
+        # 禁用 Edge 节能模式
+        "--disable-features=msEdgeEnergySaver",
+        # 禁止后台定时器节流 & 禁止渲染器后台休眠 (防止浏览器进入睡眠)
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
         FARM_URL,
     ]
     try:
