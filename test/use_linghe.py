@@ -3,6 +3,11 @@ use_linghe.py
 通过 Edge 的远程调试端口 (CDP) 连接到 https://www.duanwuqiufenmao.top/qpet/inventory,
 1) 点击 "灵核" 标签页
 2) 反复点击所有 inv-card 中的 "使用" 按钮, 直至没有可点为止 (每 1.5 秒一次)
+3) 跳转到 https://www.duanwuqiufenmao.top/qpet/weapons 做灵核合成:
+   先点击 "💎 灵核系统" Tab,
+   再依次遍历 6 个灵核类型 (锋芒/流萤/月环/耀光/赤潮/统御),
+   每个类型下依次遍历 5 个目标等级 (1级~5级),
+   对每个 (类型, 等级) 组合每 0.3 秒点击一次 "✨ 合成", 直到合成按钮变为 disabled
 
 使用前:
 1. 用以下命令以远程调试模式启动 Edge (一次性):
@@ -33,6 +38,28 @@ INV_CARD_SELECTOR = "div.inv-card-bead"
 USE_BTN_SELECTOR = "button.inv-btn-use"
 # 上架按钮 (用于判断是否还有可使用物品; 上架按钮存在说明物品未使用完)
 SELL_BTN_SELECTOR = "button.inv-btn-sell"
+
+# ---------- 灵核合成 (weapons 页) 配置 ----------
+WEAPONS_URL = "https://www.duanwuqiufenmao.top/qpet/weapons"
+# weapons 页顶部系统切换 Tab (💎 灵核系统)
+WEAPON_TAB_BTN_SELECTOR = "button.weapon-tab-btn"
+WEAPON_TAB_TEXT = "灵核系统"
+# 灵核类型按钮容器 / 按钮
+BEAD_TYPE_BTNS_SELECTOR = "div.bead-type-btns"
+BEAD_TYPE_BTN_SELECTOR = "button.bead-type-btn"
+# 目标等级按钮容器 / 按钮
+BEAD_TARGET_BTNS_SELECTOR = "div.bead-target-btns"
+BEAD_LV_BTN_SELECTOR = "button.bead-lv-btn"
+# 合成按钮
+BEAD_MERGE_BTN_SELECTOR = "button.bead-merge-btn"
+# 连续点击合成按钮的间隔 (秒)
+MERGE_INTERVAL = 0.3
+# 要遍历的灵核类型 (按页面顺序)
+BEAD_TYPES = ["锋芒", "流萤", "月环", "耀光", "赤潮", "统御"]
+# 要遍历的目标等级 (按页面顺序, 低级先合成才能供给高级)
+BEAD_LEVELS = ["1级", "2级", "3级", "4级", "5级"]
+# 单个 (类型, 等级) 组合最多点多少次合成, 防止死循环
+MAX_MERGE_PER_COMBO = 500
 
 
 def list_pages() -> list[dict]:
@@ -336,6 +363,166 @@ class CdpClient:
         except Exception:
             return 0
 
+    # ---------- 灵核合成 (weapons 页) 专属方法 ----------
+
+    @staticmethod
+    def _click_js() -> str:
+        """生成一段 JS: 对元素派发完整鼠标事件并 click."""
+        return (
+            "      el.scrollIntoView({block: 'center'});"
+            "      const opts = {bubbles: true, cancelable: true, view: window, button: 0};"
+            "      el.dispatchEvent(new PointerEvent('pointerdown', opts));"
+            "      el.dispatchEvent(new MouseEvent('mousedown', opts));"
+            "      el.dispatchEvent(new PointerEvent('pointerup', opts));"
+            "      el.dispatchEvent(new MouseEvent('mouseup', opts));"
+            "      el.click();"
+        )
+
+    def click_weapon_tab(self) -> bool:
+        """点击 weapons 页顶部的 '💎 灵核系统' Tab."""
+        js = (
+            "(function(){"
+            "  const btns = document.querySelectorAll('" + WEAPON_TAB_BTN_SELECTOR + "');"
+            "  for (const el of btns) {"
+            "    if (el.textContent && el.textContent.indexOf('" + WEAPON_TAB_TEXT + "') >= 0) {"
+            + self._click_js() +
+            "      return true;"
+            "    }"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def is_weapon_tab_active(self) -> bool:
+        """检查 '灵核系统' Tab 是否已处于 active 状态."""
+        js = (
+            "(function(){"
+            "  const btns = document.querySelectorAll('" + WEAPON_TAB_BTN_SELECTOR + "');"
+            "  for (const el of btns) {"
+            "    if (el.textContent && el.textContent.indexOf('" + WEAPON_TAB_TEXT + "') >= 0) {"
+            "      return el.classList.contains('active');"
+            "    }"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def click_bead_type(self, type_name: str) -> bool:
+        """点击指定灵核类型按钮 (锋芒/流萤/月环/耀光/赤潮/统御)."""
+        js = (
+            "(function(){"
+            "  const box = document.querySelector('" + BEAD_TYPE_BTNS_SELECTOR + "');"
+            "  if (!box) return false;"
+            "  const btns = box.querySelectorAll('" + BEAD_TYPE_BTN_SELECTOR + "');"
+            "  for (const el of btns) {"
+            "    if (el.textContent.trim() === '" + type_name + "') {"
+            + self._click_js() +
+            "      return true;"
+            "    }"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def click_bead_level(self, level_text: str) -> bool:
+        """点击指定目标等级按钮. 按钮文本形如 '1级 3碎片→', 用前缀匹配 '1级'."""
+        js = (
+            "(function(){"
+            "  const box = document.querySelector('" + BEAD_TARGET_BTNS_SELECTOR + "');"
+            "  if (!box) return false;"
+            "  const btns = box.querySelectorAll('" + BEAD_LV_BTN_SELECTOR + "');"
+            "  for (const el of btns) {"
+            # 去掉 .bead-lv-sub 的副标题文本, 只留 "N级"
+            "    const sub = el.querySelector('.bead-lv-sub');"
+            "    let txt = el.textContent.trim();"
+            "    if (sub) txt = txt.replace(sub.textContent, '').trim();"
+            "    if (txt === '" + level_text + "') {"
+            + self._click_js() +
+            "      return true;"
+            "    }"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def is_merge_btn_disabled(self) -> bool:
+        """合成按钮是否 disabled (不存在也视为 disabled, 表示不可继续合成)."""
+        js = (
+            "(function(){"
+            "  const btn = document.querySelector('" + BEAD_MERGE_BTN_SELECTOR + "');"
+            "  if (!btn) return true;"
+            "  if (btn.disabled) return true;"
+            "  if (btn.getAttribute('aria-disabled') === 'true') return true;"
+            "  const st = window.getComputedStyle(btn);"
+            "  if (st.display === 'none' || st.visibility === 'hidden') return true;"
+            "  return false;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def click_merge_btn(self) -> bool:
+        """点击 '✨ 合成' 按钮; disabled / 不存在时返回 False."""
+        js = (
+            "(function(){"
+            "  const el = document.querySelector('" + BEAD_MERGE_BTN_SELECTOR + "');"
+            "  if (!el) return false;"
+            "  if (el.disabled) return false;"
+            "  if (el.getAttribute('aria-disabled') === 'true') return false;"
+            + self._click_js() +
+            "  return true;"
+            "})()"
+        )
+        return bool(self.evaluate(js))
+
+    def merge_until_disabled(self, type_name: str, level_text: str) -> int:
+        """对当前 (类型, 等级) 组合反复点击合成, 直到合成按钮 disabled.
+        返回成功点击次数."""
+        clicked = 0
+        for _ in range(MAX_MERGE_PER_COMBO):
+            if self.is_merge_btn_disabled():
+                break
+            if not self.click_merge_btn():
+                break
+            clicked += 1
+            print(f"    [MERGE] {type_name} {level_text}: 第 {clicked} 次合成")
+            time.sleep(MERGE_INTERVAL)
+        return clicked
+
+    def merge_all_beads(self) -> int:
+        """遍历所有灵核类型 x 目标等级, 逐个合成到 disabled. 返回总合成次数."""
+        total = 0
+        for type_name in BEAD_TYPES:
+            print(f"\n--- 灵核类型: {type_name} ---")
+            if not self.click_bead_type(type_name):
+                print(f"[WARN] 未找到类型按钮 '{type_name}', 跳过")
+                continue
+            time.sleep(0.8)  # 等 DOM 切换
+            for level_text in BEAD_LEVELS:
+                # 点击等级按钮, 失败则重试 2s
+                if not self.click_bead_level(level_text):
+                    retry_end = time.time() + 2.0
+                    found = False
+                    while time.time() < retry_end:
+                        time.sleep(0.3)
+                        if self.click_bead_level(level_text):
+                            found = True
+                            break
+                    if not found:
+                        print(f"  [WARN] 未找到等级按钮 '{level_text}', 跳过")
+                        continue
+                time.sleep(0.8)  # 等合成按钮状态刷新
+                if self.is_merge_btn_disabled():
+                    print(f"  [SKIP] {type_name} {level_text}: 合成按钮已 disabled")
+                    continue
+                n = self.merge_until_disabled(type_name, level_text)
+                total += n
+                print(f"  [OK] {type_name} {level_text}: 合成 {n} 次 -> 按钮已 disabled")
+        return total
+
 
 def main():
     page = find_or_open_inventory_page()
@@ -391,7 +578,37 @@ def main():
                       f"可点={cnt}, 实际点击={clicked}, 累计={total_clicked}")
             time.sleep(CLICK_INTERVAL)
 
-        print(f"\n[DONE] 全部完成, 累计点击 '使用' 按钮 {total_clicked} 次")
+        print(f"\n[DONE] 使用阶段完成, 累计点击 '使用' 按钮 {total_clicked} 次")
+
+        # 3) 跳到 weapons 页做灵核合成
+        print(f"\n=== 跳转到 {WEAPONS_URL} 开始灵核合成 ===")
+        client.navigate(WEAPONS_URL)
+        client.wait_load(4)
+        # 先点击 '💎 灵核系统' Tab
+        for _ in range(20):
+            if client.is_weapon_tab_active():
+                print(f"[INFO] '{WEAPON_TAB_TEXT}' Tab 已是激活态, 无需点击")
+                break
+            if client.click_weapon_tab():
+                print(f"[INFO] 已点击 '{WEAPON_TAB_TEXT}' Tab")
+                break
+            time.sleep(0.3)
+        else:
+            print(f"[WARN] 未找到 '{WEAPON_TAB_TEXT}' Tab, 继续执行")
+        client.wait_load(1.5)
+        # 等类型按钮渲染出来
+        for _ in range(20):
+            if client.evaluate(
+                "!!document.querySelector('" + BEAD_TYPE_BTNS_SELECTOR + "')"
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            print(f"[WARN] 未找到 {BEAD_TYPE_BTNS_SELECTOR}, 合成阶段可能失败")
+
+        merged = client.merge_all_beads()
+        print(f"\n[DONE] 合成阶段完成, 累计合成 {merged} 次")
+        print(f"[DONE] 全部完成 (使用 {total_clicked} 次, 合成 {merged} 次)")
     finally:
         client.close()
 
