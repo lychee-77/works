@@ -12,7 +12,7 @@ auto_plant.py
 用法:
   python auto_plant.py                  # 默认 REAL, 真正点击
   python auto_plant.py --dry-run        # 只定位不点
-  python auto_plant.py --seed 胡萝卜   # 改种别的, 默认胡萝卜
+  python auto_plant.py --seed 胡萝卜   # 显式指定种子(不做回退), 默认按时段优先级选种
   python auto_plant.py --plot 1         # 只处理地块 1
 """
 
@@ -32,17 +32,21 @@ DEBUG_PORT = int(os.environ.get("FARM_DEBUG_PORT", "9222"))
 MAX_RETRY = 2
 RETRY_GAP = 1.0
 DRY_RUN = False
-SEED_NAME = "胡萝卜"  # 默认种子
 ONLY_PLOT: Optional[int] = None  # 只处理某个 plot
 
-# 按时段选种子:
+# 按优先级依次尝试的种子: 弹窗里没有 / 不可种(数量 0/disabled) 就换下一个
+# 非 0 点: 藜麦 → 玉兔萝卜 → 胡萝卜
+SEED_CHOICES: List[str] = ["藜麦", "玉兔萝卜", "胡萝卜"]
+# 按时段覆盖优先级列表:
 #   键 = (起始小时, 结束小时) 半开区间, 起始包含, 结束不包含
-#   值 = 种子名
-# 时钟走到该区间时, 当次执行自动选对应种子; 其余时段用默认 SEED_NAME
-# (CLI --seed 显式指定会覆盖下面所有规则)
-SEED_BY_HOUR: Dict[tuple, str] = {
-    (0, 1): "菠萝",  # 0:00–0:59 种菠萝 (就这一次), 其他时段种胡萝卜
+# 0:00–0:59: 黑松露 → 玉兔萝卜 → 菠萝
+# (CLI --seed 显式指定会覆盖下面所有规则, 且不做回退)
+SEED_CHOICES_BY_HOUR: Dict[tuple, List[str]] = {
+    (0, 1): ["黑松露", "玉兔萝卜", "菠萝"],
 }
+
+# 种下这些作物后, 自动使用双倍经验卡
+CARD_CROPS = ("黑松露", "玉兔萝卜", "菠萝")
 
 # 各品种的成熟生长周期(秒)
 # 菠萝只在 0:00–0:59 一次性种下后, 需要等它生长完才能再种/收
@@ -749,7 +753,7 @@ def main():
     cdp.send("Page.enable")
     print(f"[+] {target.get('url','')}")
     log_lines.append(f"# 自动种菜日志  URL: {target.get('url','')}")
-    log_lines.append(f"# 模式: {'DRY-RUN' if DRY_RUN else 'REAL'}  种子: {SEED_NAME}  地块过滤: {ONLY_PLOT or '全部'}")
+    log_lines.append(f"# 模式: {'DRY-RUN' if DRY_RUN else 'REAL'}  种子优先级: {' → '.join(SEED_CHOICES)}  地块过滤: {ONLY_PLOT or '全部'}")
 
     def log(msg):
         print(msg); log_lines.append(msg)
@@ -799,6 +803,7 @@ def main():
     # 底部会有"轮后复查"统一算 NEXT_INTERVAL, 这里不再提前 return, 避免 NameError
 
     summary = []
+    planted_seeds: List[str] = []  # 每块地实际种下的种子(可能是备选)
     for p in to_plant:
         plot_no = p["plotNo"]
         log(f"\n========== 地块 {plot_no} 流程 ==========")
@@ -969,14 +974,34 @@ def main():
             else:
                 continue  # 全部尝试都失败
 
-        # --- 步骤 B: 找"胡萝卜"菜单项的"种植"按钮 ---
+        # --- 步骤 B: 按优先级找种子菜单项的"种植"按钮; 弹窗里没有/不可种就自动换下一个 ---
+        seed_choices: List[str] = []
+        for s in SEED_CHOICES:
+            if s not in seed_choices:
+                seed_choices.append(s)
         ok_seed = False
-        for attempt in range(1, MAX_RETRY + 1):
-            log(f"[B] 第 {attempt}/{MAX_RETRY} 次定位 '{SEED_NAME}' 菜单项的种植按钮")
-            expr_b = LOCATE_SEED_BTN_JS.replace("SEEDARGS", json.dumps({"seedName": SEED_NAME}))
+        planted_seed = None
+        seed_idx = 0
+        seed_name = seed_choices[0]
+        attempt = 0
+        while seed_idx < len(seed_choices):
+            attempt += 1
+            log(f"[B] 第 {attempt}/{MAX_RETRY} 次定位 '{seed_name}' 菜单项的种植按钮")
+            expr_b = LOCATE_SEED_BTN_JS.replace("SEEDARGS", json.dumps({"seedName": seed_name}))
             seed_pos = js(cdp, expr_b)
             if not seed_pos.get("ok"):
-                log(f"  ✗ 失败: {seed_pos.get('reason')}")
+                reason = seed_pos.get("reason") or ""
+                # 弹窗里没有该种子, 或菜单项没有可点的"种植"按钮(种子数为 0/disabled) → 换备选
+                if seed_idx + 1 < len(seed_choices) and (
+                    "未找到文本" in reason or "没找到对应" in reason
+                ):
+                    log(f"  ⚠ 首选 '{seed_name}' 不可种: {reason}")
+                    seed_idx += 1
+                    seed_name = seed_choices[seed_idx]
+                    log(f"  → 换备选种子 '{seed_name}' 重新定位")
+                    attempt = 0  # 备选种子重新计重试次数
+                    continue
+                log(f"  ✗ 失败: {reason}")
                 if seed_pos.get("debug"):
                     dbg = seed_pos["debug"]
                     log(f"  ── debug ──")
@@ -1018,7 +1043,7 @@ def main():
             # 不在视口内 → 滚动
             if not seed_pos.get("inViewport"):
                 log(f"  → 按钮不在视口内, 滚到中心")
-                scroll_expr = SCROLL_TO_BTN_JS.replace("SEEDNAME", json.dumps(SEED_NAME))
+                scroll_expr = SCROLL_TO_BTN_JS.replace("SEEDNAME", json.dumps(seed_name))
                 scroll_res = js(cdp, scroll_expr)
                 if not scroll_res.get("ok"):
                     log(f"  ⚠ 滚动失败: {scroll_res.get('reason')}")
@@ -1037,10 +1062,11 @@ def main():
             if DRY_RUN:
                 log(f"  → [DRY-RUN] 跳过真实派发")
                 ok_seed = True
+                planted_seed = seed_name
                 break
             # 优先用 DOM 派发 click (绕过坐标遮挡问题)
             click_res = js(cdp, DISPATCH_CLICK_JS.replace("CLICKARGS",
-                json.dumps({"text": SEED_NAME, "selectorXPath": None})))
+                json.dumps({"text": seed_name, "selectorXPath": None})))
             if click_res.get("ok"):
                 log(f"  → DOM 派发 click 成功  btn.text='{click_res.get('text')}'")
             else:
@@ -1073,8 +1099,9 @@ def main():
             # 验证: 弹窗是否消失(说明点中了)
             still_open = not dialog_closed
             if not still_open:
-                log(f"  ✓ 弹窗已消失, 种菜成功")
+                log(f"  ✓ 弹窗已消失, 种菜成功 (种子: {seed_name})")
                 ok_seed = True
+                planted_seed = seed_name
                 break
             else:
                 log(f"  ⚠ 弹窗还在, 可能点错了或被遮挡 (尝试 {attempt})")
@@ -1083,11 +1110,12 @@ def main():
                                 "reason": "弹窗未消失"})
                 break
         if ok_seed:
-            summary.append({"plotNo": plot_no, "ok": True, "stage": "B"})
+            summary.append({"plotNo": plot_no, "ok": True, "stage": "B", "seed": planted_seed})
+            planted_seeds.append(planted_seed)
 
-            # ==== 阶段 C: 用道具(双倍经验卡) — 仅本次种菠萝时触发 ====
-            if SEED_NAME == "菠萝":
-                log(f"\n[C] 地块{plot_no} 种菠萝成功, 开始用双倍经验卡")
+            # ==== 阶段 C: 用道具(双倍经验卡) — 仅本次实际种黑松露/玉兔萝卜/菠萝时触发 ====
+            if planted_seed in CARD_CROPS:
+                log(f"\n[C] 地块{plot_no} 种{planted_seed}成功, 开始用双倍经验卡")
 
                 # C0: 关掉残留弹窗(可能还有 el-overlay 空壳)
                 force_close_dialogs()
@@ -1256,7 +1284,7 @@ def main():
     max_crop = "?"
     max_plot = None
     if recheck and recheck.get("ok") and recheck.get("plots"):
-        KNOWN_CROPS = ["菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+        KNOWN_CROPS = ["黑松露", "藜麦", "玉兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
         for p in recheck["plots"]:
             # 取 crop: 优先走 boxText 匹配已知菜名 (复用同文件前面抓 plot 的逻辑)
             crop = ""
@@ -1390,7 +1418,7 @@ def main():
     if remain_res and remain_res.get("ok"):
         for rp in remain_res.get("plots", []):
             remain_by_plot[rp["plotNo"]] = {"sec": rp.get("sec", 0), "hits": rp.get("hits", [])}
-    KNOWN_CROPS = ["菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+    KNOWN_CROPS = ["黑松露", "藜麦", "玉兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
     if recheck and recheck.get("ok") and recheck.get("plots"):
         for p in recheck["plots"]:
             # 取 crop
@@ -1431,7 +1459,7 @@ def main():
     log("[总结]")
     succ = sum(1 for s in summary if s["ok"])
     fail = len(summary) - succ
-    log(f"  成功: {succ}  失败: {fail}  SEED_NAME={SEED_NAME!r}")
+    log(f"  成功: {succ}  失败: {fail}  种子优先级={SEED_CHOICES!r} 实际种下={planted_seeds!r}")
     for s in summary:
         log(f"  {'✓' if s['ok'] else '✗'} 地块{s['plotNo']}  stage={s.get('stage')}  reason={s.get('reason','-')!r}")
 
@@ -1440,9 +1468,9 @@ def main():
     nxt = max_remain if max_remain > 0 else DEFAULT_GROW_TIME
     log(f"[+] NEXT_INTERVAL={nxt}  (地里最长剩余={max_crop!r}, 下次 {nxt/60:.1f} 分钟 = {nxt/3600:.2f} 小时后启动)")
 
-    # 下次收菜动作: 仅本次种菠萝时, 加"道具"动作
-    if succ > 0 and SEED_NAME == "菠萝":
-        log(f"[+] NEXT_HARVEST_ACTIONS=道具,翻地,收获  (种了菠萝, 下次收菜顺带按道具按钮)")
+    # 下次收菜动作: 仅本次实际种了黑松露/玉兔萝卜/菠萝时, 加"道具"动作
+    if succ > 0 and any(s in CARD_CROPS for s in planted_seeds):
+        log(f"[+] NEXT_HARVEST_ACTIONS=道具,翻地,收获  (种了黑松露/玉兔萝卜/菠萝, 下次收菜顺带按道具按钮)")
     else:
         log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
 
@@ -1459,7 +1487,7 @@ if __name__ == "__main__":
         i = args.index("--seed")
         if i + 1 < len(args):
             explicit_seed = args[i + 1]
-            SEED_NAME = explicit_seed
+            SEED_CHOICES = [explicit_seed]  # 显式指定时不做回退
             args = args[:i] + args[i+2:]
     if "--plot" in args:
         i = args.index("--plot")
@@ -1467,14 +1495,18 @@ if __name__ == "__main__":
             ONLY_PLOT = int(args[i + 1])
             args = args[:i] + args[i+2:]
 
-    # CLI 没显式 --seed 时, 按当前小时查 SEED_BY_HOUR
+    # CLI 没显式 --seed 时, 按当前小时查 SEED_CHOICES_BY_HOUR
+    #   0:00–0:59  → 黑松露 → 玉兔萝卜 → 菠萝
+    #   其余时段    → 藜麦 → 玉兔萝卜 → 胡萝卜
     if explicit_seed is None:
         from datetime import datetime
         h = datetime.now().hour
-        for (lo, hi), seed in SEED_BY_HOUR.items():
+        for (lo, hi), choices in SEED_CHOICES_BY_HOUR.items():
             if lo <= h < hi:
-                SEED_NAME = seed
-                print(f"[+] 时段 {lo:02d}:00–{hi:02d}:59 → 自动选种子: {SEED_NAME}")
+                SEED_CHOICES = list(choices)
+                print(f"[+] 时段 {lo:02d}:00–{hi:02d}:59 → 种子优先级: {' → '.join(SEED_CHOICES)}")
                 break
+        else:
+            print(f"[+] 非 0 点时段 ({h:02d} 点) → 种子优先级: {' → '.join(SEED_CHOICES)}")
 
     sys.exit(main())
