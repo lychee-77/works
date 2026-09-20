@@ -35,18 +35,18 @@ DRY_RUN = False
 ONLY_PLOT: Optional[int] = None  # 只处理某个 plot
 
 # 按优先级依次尝试的种子: 弹窗里没有 / 不可种(数量 0/disabled) 就换下一个
-# 非 0 点: 藜麦 → 玉兔萝卜 → 胡萝卜
-SEED_CHOICES: List[str] = ["藜麦", "玉兔萝卜", "胡萝卜"]
+# 非 0 点: 藜麦 → 月兔萝卜 → 胡萝卜
+SEED_CHOICES: List[str] = ["藜麦", "月兔萝卜", "胡萝卜"]
 # 按时段覆盖优先级列表:
 #   键 = (起始小时, 结束小时) 半开区间, 起始包含, 结束不包含
-# 0:00–0:59: 黑松露 → 玉兔萝卜 → 菠萝
+# 0:00–0:59: 黑松露 → 月兔萝卜 → 菠萝
 # (CLI --seed 显式指定会覆盖下面所有规则, 且不做回退)
 SEED_CHOICES_BY_HOUR: Dict[tuple, List[str]] = {
-    (0, 1): ["黑松露", "玉兔萝卜", "菠萝"],
+    (0, 1): ["黑松露", "月兔萝卜", "菠萝"],
 }
 
 # 种下这些作物后, 自动使用双倍经验卡
-CARD_CROPS = ("黑松露", "玉兔萝卜", "菠萝")
+CARD_CROPS = ("黑松露", "月兔萝卜", "菠萝")
 
 # 各品种的成熟生长周期(秒)
 # 菠萝只在 0:00–0:59 一次性种下后, 需要等它生长完才能再种/收
@@ -625,6 +625,111 @@ LOCATE_PROP_USE_BTN_JS = r"""
 """
 
 
+# 直接派发点击某地块的"道具"按钮 (占位符 __PLOTNO__)
+DISPATCH_PLOT_PROP_CLICK_JS = r"""
+(() => {
+  const norm = (s) => (s || '').replace(/[​‌‍⁠﻿­]/g, '').trim();
+  const ad = document.querySelector('.farm-ad-card');
+  if (!ad) return { ok: false, reason: 'no ad' };
+  const second = ad.previousElementSibling.children[1];
+  if (!second) return { ok: false, reason: 'no second' };
+  const allBtns = Array.from(second.querySelectorAll('button'))
+    .filter(b => norm(b.innerText) === '道具' && !b.hasAttribute('disabled'));
+  const seen = new Set();
+  for (const b of allBtns) {
+    let plotBox = null, el = b;
+    for (let i = 0; i < 6 && el && second.contains(el); i++) {
+      const t = norm(el.innerText || '');
+      if (/地块\s*\d+/.test(t) && el.querySelectorAll('button').length > 0) {
+        plotBox = el; break;
+      }
+      el = el.parentElement;
+    }
+    if (!plotBox || seen.has(plotBox)) continue;
+    seen.add(plotBox);
+    const boxText = norm(plotBox.innerText || '');
+    let minN = Infinity;
+    for (const m of boxText.matchAll(/地块\s*(\d+)/g)) {
+      const n = parseInt(m[1]); if (n < minN) minN = n;
+    }
+    if (minN === __PLOTNO__) {
+      b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+      b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+      b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+      return { ok: true };
+    }
+  }
+  return { ok: false, reason: 'plot prop btn not found' };
+})()
+"""
+
+
+# 道具弹窗里检查"双倍经验卡": "使用"按钮可点则点击; 已用过(按钮禁用/隐藏)则返回 alreadyUsed
+# (禁用判定与 use_linghe.py 一致: disabled 属性 / aria-disabled / display:none / visibility:hidden)
+CHECK_OR_USE_CARD_JS = r"""
+(() => {
+  const norm = (s) => (s || '').replace(/[​‌‍⁠﻿­]/g, '').trim();
+  let dialog = null;
+  for (const ov of document.querySelectorAll('div.el-overlay')) {
+    const d = ov.querySelector('div.el-dialog');
+    if (!d) continue;
+    const r = d.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
+      dialog = d; break;
+    }
+  }
+  if (!dialog) return { ok: false, reason: '道具弹窗未出现' };
+  const candidates = Array.from(dialog.querySelectorAll('*'))
+    .filter(e => norm(e.innerText) === '双倍经验卡' && e.children.length === 0);
+  if (candidates.length === 0) return { ok: false, reason: '弹窗里没找到"双倍经验卡"' };
+  let useBtn = null;
+  let itemText = '';
+  for (const span of candidates) {
+    let el = span;
+    for (let i = 0; i < 6; i++) {
+      el = el.parentElement;
+      if (!el || !dialog.contains(el)) break;
+      const btns = Array.from(el.querySelectorAll(':scope > button'));
+      const btn = btns.find(b => norm(b.innerText) === '使用');
+      if (btn) { useBtn = btn; itemText = norm(el.innerText).replace(/\s+/g, ' ').slice(0, 120); break; }
+    }
+    if (useBtn) break;
+  }
+  if (!useBtn) return { ok: false, reason: '找不到"双倍经验卡"的"使用"按钮' };
+  const st = getComputedStyle(useBtn);
+  const disabled = useBtn.hasAttribute('disabled') || useBtn.disabled === true
+    || useBtn.getAttribute('aria-disabled') === 'true'
+    || st.display === 'none' || st.visibility === 'hidden';
+  if (disabled) return { ok: true, alreadyUsed: true, itemText };
+  useBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
+  useBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+  useBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+  return { ok: true, alreadyUsed: false, itemText };
+})()
+"""
+
+
+# 关闭所有 Element UI 弹窗: ESC + 点 mask + 点右上角 X (不依赖按钮文本, 无需零宽字符处理)
+CLOSE_DIALOG_JS = r"""
+(() => {
+  for (let i = 0; i < 3; i++) {
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+    document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+  }
+  for (const ov of document.querySelectorAll('div.el-overlay')) {
+    const mask = ov.querySelector('div.el-overlay-dialog');
+    if (mask) mask.click();
+    const dlg = ov.querySelector('div.el-dialog');
+    if (dlg) {
+      const closeBtn = dlg.querySelector('.el-dialog__headerbtn, .el-dialog__close');
+      if (closeBtn) closeBtn.click();
+    }
+  }
+  return true;
+})()
+"""
+
+
 # 找地块"道具"按钮的坐标(用来触发弹窗)
 # 逻辑和 LOCATE_PLOT_PLANT_BTN_JS 一模一样: 文本=道具 的 button, 向上找含"地块 plotNo"的容器
 LOCATE_PLOT_PROP_BTN_JS = r"""
@@ -804,6 +909,29 @@ def main():
 
     summary = []
     planted_seeds: List[str] = []  # 每块地实际种下的种子(可能是备选)
+    card_used_plots: set = set()  # 本次运行已成功使用双倍卡的地块号 (阶段 C/D 共用, 避免重复开弹窗)
+
+    # 弹窗辅助函数: 定义在循环外, 保证 to_plant 为空时阶段 D 也能调用
+    def dialog_real_open():
+        # 弹窗是否"真的开": 有 el-dialog 节点, 有 button, 且 rect 非 0
+        return js(cdp, r'''
+(() => {
+  const overlays = document.querySelectorAll('div.el-overlay');
+  for (const ov of overlays) {
+    const d = ov.querySelector('div.el-dialog');
+    if (!d) continue;
+    const r = d.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
+      return true;
+    }
+  }
+  return false;
+})()
+        ''')
+
+    def close_dialogs():
+        js(cdp, CLOSE_DIALOG_JS)
+
     for p in to_plant:
         plot_no = p["plotNo"]
         log(f"\n========== 地块 {plot_no} 流程 ==========")
@@ -848,22 +976,7 @@ def main():
         time.sleep(0.5)
 
         # --- 步骤 A: 触发弹窗 ---
-        # 检查弹窗是否"真的开": 有 el-dialog 节点, 且有 button, 且 rect 非 0
-        def dialog_real_open():
-            return js(cdp, r'''
-(() => {
-  const overlays = document.querySelectorAll('div.el-overlay');
-  for (const ov of overlays) {
-    const d = ov.querySelector('div.el-dialog');
-    if (!d) continue;
-    const r = d.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
-      return true;
-    }
-  }
-  return false;
-})()
-            ''')
+        # dialog_real_open() 已在循环外定义 (to_plant 为空时阶段 D 也要用)
         def has_stale_overlay():
             """即使没真弹窗, 只要有 el-overlay 残留空壳也算"需要重置" """
             return js(cdp, r'''
@@ -1113,7 +1226,7 @@ def main():
             summary.append({"plotNo": plot_no, "ok": True, "stage": "B", "seed": planted_seed})
             planted_seeds.append(planted_seed)
 
-            # ==== 阶段 C: 用道具(双倍经验卡) — 仅本次实际种黑松露/玉兔萝卜/菠萝时触发 ====
+            # ==== 阶段 C: 用道具(双倍经验卡) — 仅本次实际种黑松露/月兔萝卜/菠萝时触发 ====
             if planted_seed in CARD_CROPS:
                 log(f"\n[C] 地块{plot_no} 种{planted_seed}成功, 开始用双倍经验卡")
 
@@ -1269,11 +1382,89 @@ def main():
                 verify = {"gone": c_gone, "poll": c_poll, "elapsed_ms": t_c}
                 if c_gone:
                     log(f"  ✓ 道具弹窗已消失, 双倍经验卡使用成功 (poll={c_poll} 次, {int(t_c)}ms)")
+                    card_used_plots.add(plot_no)
                 else:
                     log(f"  ⚠ 道具弹窗还在, 可能点错或被遮挡 (poll={c_poll} 次, {int(t_c)}ms)")
                     summary.append({"plotNo": plot_no, "ok": False, "stage": "C-verify",
                                     "reason": "弹窗未消失"})
                     break
+
+    # ===== 阶段 D: 已种植但未使用双倍卡的 CARD_CROPS 地块, 补用 =====
+    # 覆盖本轮没新种、但地里已长着黑松露/月兔萝卜/菠萝且没用卡的地块;
+    # 已用过卡时, 道具弹窗里"双倍经验卡"的"使用"按钮为禁用态, 直接跳过。
+    def ensure_card_if_needed(plot_no, crop):
+        """开地块道具弹窗: 使用按钮可点→用卡; 禁用→已用跳过。
+        返回 'used' / 'already' / 'fail' / 'dry-run'。"""
+        if DRY_RUN:
+            log(f"  → [DRY-RUN] 地块{plot_no}({crop}) 跳过补卡")
+            return "dry-run"
+        # 单次尝试, 不重试: 开道具弹窗 → 检查/使用双倍卡 → 等弹窗消失
+        close_dialogs()
+        time.sleep(0.3)
+        d = js(cdp, DISPATCH_PLOT_PROP_CLICK_JS.replace("__PLOTNO__", str(plot_no)))
+        if not d.get("ok"):
+            log(f"  ✗ 地块{plot_no} 道具按钮派发失败: {d.get('reason')}")
+            return "fail"
+        # 等弹窗 (上限 3s)
+        t0 = time.time(); opened = False
+        while time.time() - t0 < 3.0:
+            if dialog_real_open():
+                opened = True; break
+            time.sleep(0.15)
+        if not opened:
+            log(f"  ✗ 地块{plot_no} 道具弹窗未出现")
+            close_dialogs()
+            return "fail"
+        r = js(cdp, CHECK_OR_USE_CARD_JS)
+        if r.get("ok") and r.get("alreadyUsed"):
+            log(f"  ✓ 地块{plot_no}({crop}) 双倍卡已使用过(使用按钮禁用), 跳过")
+            close_dialogs()
+            return "already"
+        if not r.get("ok"):
+            log(f"  ✗ 地块{plot_no} 检查双倍卡失败: {r.get('reason')}")
+            close_dialogs()
+            return "fail"
+        # 已点击"使用", 等弹窗消失
+        t0 = time.time(); gone = False
+        while time.time() - t0 < 3.0:
+            if not dialog_real_open():
+                gone = True; break
+            time.sleep(0.15)
+        close_dialogs()
+        if gone:
+            log(f"  ✓ 地块{plot_no}({crop}) 双倍卡补用成功")
+            return "used"
+        log(f"  ⚠ 地块{plot_no} 点使用后弹窗未消失")
+        return "fail"
+
+    log("\n========== 阶段 D: 扫描已种植地块, 补用双倍经验卡 ==========")
+    time.sleep(1.0)  # 让 UI 渲染稳定
+    scan_res = js(cdp, FETCH_PLOTS_JS)
+    SCAN_KNOWN_CROPS = ["黑松露", "藜麦", "月兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦",
+                        "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+    if scan_res and scan_res.get("ok"):
+        d_targets = []
+        for p in scan_res["plots"]:
+            plot_no = p["plotNo"]
+            if p.get("isEmpty"):
+                continue
+            if plot_no in card_used_plots:
+                log(f"[D] 地块{plot_no} 本轮已用卡, 跳过")
+                continue
+            status = p.get("status") or ""
+            crop = next((c for c in SCAN_KNOWN_CROPS if c in status), "")
+            if crop in CARD_CROPS:
+                d_targets.append((plot_no, crop))
+        log(f"[D] 待检查地块: {[(n, c) for n, c in d_targets]}")
+        for plot_no, crop in d_targets:
+            log(f"[D] 地块{plot_no} 已种{crop}, 开道具弹窗检查双倍卡...")
+            result = ensure_card_if_needed(plot_no, crop)
+            summary.append({"plotNo": plot_no, "ok": result in ("used", "already", "dry-run"),
+                            "stage": f"D-{result}", "seed": crop})
+            if result == "used":
+                card_used_plots.add(plot_no)
+    else:
+        log(f"[D] 抓地块失败: {scan_res}, 跳过补卡扫描")
 
     # ===== 种完后再检查一遍地, 按所有地块里菜种的最长生长周期决定下次启动间隔 =====
     # 菠萝只种一轮; 但地里可能还有上轮没被翻掉的成熟菜/枯草, 一并算进去 → 取 max
@@ -1284,7 +1475,7 @@ def main():
     max_crop = "?"
     max_plot = None
     if recheck and recheck.get("ok") and recheck.get("plots"):
-        KNOWN_CROPS = ["黑松露", "藜麦", "玉兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+        KNOWN_CROPS = ["黑松露", "藜麦", "月兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
         for p in recheck["plots"]:
             # 取 crop: 优先走 boxText 匹配已知菜名 (复用同文件前面抓 plot 的逻辑)
             crop = ""
@@ -1418,7 +1609,7 @@ def main():
     if remain_res and remain_res.get("ok"):
         for rp in remain_res.get("plots", []):
             remain_by_plot[rp["plotNo"]] = {"sec": rp.get("sec", 0), "hits": rp.get("hits", [])}
-    KNOWN_CROPS = ["黑松露", "藜麦", "玉兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
+    KNOWN_CROPS = ["黑松露", "藜麦", "月兔萝卜", "菠萝", "胡萝卜", "白菜", "小麦", "玉米", "土豆", "番茄", "茄子", "辣椒", "南瓜", "西瓜", "草莓", "葡萄"]
     if recheck and recheck.get("ok") and recheck.get("plots"):
         for p in recheck["plots"]:
             # 取 crop
@@ -1468,11 +1659,8 @@ def main():
     nxt = max_remain if max_remain > 0 else DEFAULT_GROW_TIME
     log(f"[+] NEXT_INTERVAL={nxt}  (地里最长剩余={max_crop!r}, 下次 {nxt/60:.1f} 分钟 = {nxt/3600:.2f} 小时后启动)")
 
-    # 下次收菜动作: 仅本次实际种了黑松露/玉兔萝卜/菠萝时, 加"道具"动作
-    if succ > 0 and any(s in CARD_CROPS for s in planted_seeds):
-        log(f"[+] NEXT_HARVEST_ACTIONS=道具,翻地,收获  (种了黑松露/玉兔萝卜/菠萝, 下次收菜顺带按道具按钮)")
-    else:
-        log(f"[+] NEXT_HARVEST_ACTIONS=翻地,收获")
+    # 双倍经验卡已统一在种植后使用 (阶段 C 新种即用 + 阶段 D 补卡), 收菜只做翻地/收获
+    log("[+] NEXT_HARVEST_ACTIONS=翻地,收获")
 
     cdp.close()
     return 0
@@ -1496,8 +1684,8 @@ if __name__ == "__main__":
             args = args[:i] + args[i+2:]
 
     # CLI 没显式 --seed 时, 按当前小时查 SEED_CHOICES_BY_HOUR
-    #   0:00–0:59  → 黑松露 → 玉兔萝卜 → 菠萝
-    #   其余时段    → 藜麦 → 玉兔萝卜 → 胡萝卜
+    #   0:00–0:59  → 黑松露 → 月兔萝卜 → 菠萝
+    #   其余时段    → 藜麦 → 月兔萝卜 → 胡萝卜
     if explicit_seed is None:
         from datetime import datetime
         h = datetime.now().hour

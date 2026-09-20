@@ -32,8 +32,6 @@ DRY_RUN = False
 # 要处理的按钮类型(逗号分隔, 优先级从左到右): 收获 / 铲除 / 浇水 / 翻地
 # 默认改为"翻地,收获": 同一地块先翻地, 再收获
 TARGET_ACTIONS = "翻地,收获"
-# 收获这些作物前, 先对地块用双倍经验卡
-CARD_CROPS = ("黑松露", "玉兔萝卜", "菠萝")
 
 
 # 强制 stdout/stderr 用 UTF-8 (Windows 默认 GBK, 中文 + 特殊字符会乱码/崩)
@@ -175,7 +173,7 @@ FETCH_PLOTS_JS = r"""
 
     // 识别地块里种的是什么菜: 遍历 boxText 找已知菜名
     // 找法: 在 plotBox 内先找 (短的) 文本节点, 等于"菠萝"/"胡萝卜"/"白菜"/"小麦"/"玉米"等
-    const KNOWN_CROPS = ['黑松露', '藜麦', '玉兔萝卜', '菠萝', '胡萝卜', '白菜', '小麦', '玉米', '土豆', '番茄', '茄子', '辣椒', '南瓜', '西瓜', '草莓', '葡萄'];
+    const KNOWN_CROPS = ['黑松露', '藜麦', '月兔萝卜', '菠萝', '胡萝卜', '白菜', '小麦', '玉米', '土豆', '番茄', '茄子', '辣椒', '南瓜', '西瓜', '草莓', '葡萄'];
     let crop = '';
     for (const c of KNOWN_CROPS) {
       // 必须有纯文本叶节点 = 该菜名, 避免误匹配 "土地上长着胡萝卜的图标" 这种长文本
@@ -313,14 +311,13 @@ def main():
             f"btn={'有('+p['harvestBtn']['text']+')' if p['harvestBtn'] else '无':6s}  "
             f"status={p['status'][:50]!r}")
 
-    # ===== 解析 actions 列表 (仅供调度兼容, 真正的执行逻辑在 execute_plot 里) =====
-    # 保留 CLI --action 仅影响下面"是否执行翻地/收获"两个动作;
-    # 双倍经验卡 / 道具按钮: 完全由地块实际种的是不是黑松露/玉兔萝卜/菠萝决定, 与 --action 无关
+    # ===== 解析 actions 列表 =====
+    # CLI --action 只决定"是否执行翻地/收获"; 双倍经验卡已改到 auto_plant.py 种植后使用
     actions = [a.strip() for a in TARGET_ACTIONS.split(",") if a.strip()]
     log(f"\n[+] 动作列表 (CLI 传入, 仅决定翻地/收获是否跑): {actions}")
     do_tilling = "翻地" in actions
     do_harvest = "收获" in actions
-    log(f"[+] 实际执行: 翻地={do_tilling}  收获={do_harvest}  (双倍卡: 地块种黑松露/玉兔萝卜/菠萝时自动触发, 与 actions 无关)")
+    log(f"[+] 实际执行: 翻地={do_tilling}  收获={do_harvest}  (双倍卡在种植后使用, 收菜不再处理)")
 
     # 提取所有"含目标按钮"的地块: 一个地块只要任一 action 按钮存在就算候选
     def plot_has_action(plot, action):
@@ -343,13 +340,13 @@ def main():
         return None
 
     # 生成候选地块: 只要地块里有翻地或收获按钮, 就进候选
-    # 每个地块只执行一次循环 (execute_plot 内部按 翻地→（菠萝）道具+双倍卡→收获 顺序)
+    # 每个地块只执行一次循环 (内部按 翻地→收获 顺序)
     tasks = []
     for p in plots_initial:
         # 只在以下情况拉入: 有翻地按钮 或 有收获按钮
         if (do_tilling and plot_has_action(p, "翻地")) or (do_harvest and plot_has_action(p, "收获")):
             tasks.append(p)
-    log(f"\n[+] 待执行地块: {len(tasks)} 个 (按地块循环, 每地块内: 翻地 →（黑松露/玉兔萝卜/菠萝则）双倍卡 → 收获)")
+    log(f"\n[+] 待执行地块: {len(tasks)} 个 (按地块循环, 每地块内: 翻地 → 收获)")
     for p in tasks:
         log(f"  地块{p['plotNo']}  crop={p.get('crop','?')!r}  state={p['state']}  "
             f"翻地={'✓' if plot_has_action(p,'翻地') else '✗'}  收获={'✓' if plot_has_action(p,'收获') else '✗'}")
@@ -474,129 +471,7 @@ def main():
         log(f"  ✗ 地块 {plot_no} 动作 '{btn_text}' 全部尝试失败")
         return {"ok": False, "reason": "max retries", "attempts": attempts}
 
-    # ===== 黑松露/玉兔萝卜/菠萝的 "道具 → 双倍经验卡" 流程 =====
-    # 仅在地块 crop ∈ CARD_CROPS 且地块有"收获"按钮(意味着马上要收) 时执行
-    # 顺序: 派发点击地块的"道具"按钮 → 等道具弹窗 → 找"双倍经验卡"的"使用"按钮 → 派发
-    LOCATE_PLOT_PROP_BTN_JS_HARV = r"""
-((args) => {
-  const { plotNo } = args;
-  const ad = document.querySelector('.farm-ad-card');
-  if (!ad) return { ok: false, reason: 'no ad' };
-  const prev = ad.previousElementSibling;
-  const second = prev.children[1];
-  if (!second) return { ok: false, reason: 'no second' };
-  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-  const allBtns = Array.from(second.querySelectorAll('button'))
-    .filter(b => norm(b.innerText) === '道具' && !b.hasAttribute('disabled'));
-  const seen = new Set();
-  for (const b of allBtns) {
-    let plotBox = null, el = b;
-    for (let i = 0; i < 6 && el && second.contains(el); i++) {
-      const t = norm(el.innerText || '');
-      if (/地块\s*\d+/.test(t) && el.querySelectorAll('button').length > 0) { plotBox = el; break; }
-      el = el.parentElement;
-    }
-    if (!plotBox || seen.has(plotBox)) continue;
-    seen.add(plotBox);
-    const boxText = norm(plotBox.innerText || '');
-    let minN = Infinity;
-    for (const m of boxText.matchAll(/地块\s*(\d+)/g)) {
-      const n = parseInt(m[1]); if (n < minN) minN = n;
-    }
-    if (minN === plotNo) {
-      b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
-      b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-      b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-      return { ok: true, plotNo };
-    }
-  }
-  return { ok: false, reason: `plot ${plotNo} 无"道具"按钮` };
-})(PROPARGS)
-"""
-    LOCATE_PROP_USE_BTN_JS_HARV = r"""
-(() => {
-  const norm = (s) => (s || '').replace(/[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g, '').trim();
-  let dialog = null;
-  const allOverlays = document.querySelectorAll('div.el-overlay');
-  for (const ov of allOverlays) {
-    const d = ov.querySelector('div.el-dialog');
-    if (!d) continue;
-    const r = d.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
-      dialog = d; break;
-    }
-  }
-  if (!dialog) return { ok: false, reason: '道具弹窗未真正出现' };
-  const candidates = Array.from(dialog.querySelectorAll('*'))
-    .filter(e => norm(e.innerText) === '双倍经验卡' && e.children.length === 0);
-  if (candidates.length === 0) return { ok: false, reason: '道具弹窗里没找到"双倍经验卡"' };
-  let useBtn = null;
-  for (const span of candidates) {
-    let el = span;
-    for (let i = 0; i < 6; i++) {
-      el = el.parentElement;
-      if (!el || !dialog.contains(el)) break;
-      const btns = Array.from(el.querySelectorAll(':scope > button'));
-      const btn = btns.find(b => norm(b.innerText) === '使用' && !b.hasAttribute('disabled'));
-      if (btn) { useBtn = btn; break; }
-    }
-    if (useBtn) break;
-  }
-  if (!useBtn) return { ok: false, reason: '找不到"双倍经验卡"的"使用"按钮' };
-  // 派发 click + pointer
-  useBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, button: 0 }));
-  useBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
-  useBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
-  return { ok: true };
-})()
-"""
-
-    def use_double_xp_card(cdp, plot_no, crop):
-        """对种黑松露/玉兔萝卜/菠萝的地块: 点'道具'按钮触发弹窗, 再找'双倍经验卡'并点'使用'."""
-        if DRY_RUN:
-            log(f"\n[道具·双倍卡] 地块 {plot_no} ({crop}) — [DRY-RUN] 跳过")
-            return {"ok": True, "reason": "dry-run"}
-        for attempt in range(1, MAX_RETRY + 1):
-            log(f"\n[道具·双倍卡] 地块 {plot_no} ({crop}) 第 {attempt}/{MAX_RETRY} 次")
-            # 1) 点 道具 按钮
-            d1 = js(cdp, LOCATE_PLOT_PROP_BTN_JS_HARV.replace("PROPARGS", json.dumps({"plotNo": plot_no})))
-            if not d1.get("ok"):
-                log(f"  ✗ 派发'道具'按钮失败: {d1.get('reason')}")
-                time.sleep(RETRY_GAP); continue
-            log(f"  ✓ 已点'道具'按钮, 等弹窗...")
-            # 2) 等弹窗 + 找双倍卡并点使用
-            time.sleep(1.0)
-            d2 = js(cdp, LOCATE_PROP_USE_BTN_JS_HARV)
-            if not d2.get("ok"):
-                log(f"  ✗ 找/点 双倍卡失败: {d2.get('reason')}")
-                time.sleep(RETRY_GAP); continue
-            # 3) 自旋等弹窗消失
-            t_c0 = time.time(); c_gone = False; c_poll = 0
-            while time.time() - t_c0 < 3.0:
-                c_poll += 1
-                v = js(cdp, r"""
-(() => {
-  const overlays = document.querySelectorAll('div.el-overlay');
-  for (const ov of overlays) {
-    const d = ov.querySelector('div.el-dialog');
-    if (!d) continue;
-    const r = d.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && d.querySelectorAll('button').length > 0) {
-      return { gone: false };
-    }
-  }
-  return { gone: true };
-})()
-""")
-                if v and v.get("gone"): c_gone = True; break
-                time.sleep(0.15)
-            if c_gone:
-                log(f"  ✓ 双倍卡已使用, 弹窗消失 (poll={c_poll}, {int((time.time()-t_c0)*1000)}ms)")
-                return {"ok": True, "reason": "use card ok"}
-            log(f"  ⚠ 弹窗 3s 仍未消失")
-        return {"ok": False, "reason": "max retries"}
-
-    # ===== 按地块循环执行: 翻地 → （黑松露/玉兔萝卜/菠萝）道具+双倍卡 → 收获 =====
+    # ===== 按地块循环执行: 翻地 → 收获 =====
     summary = []
     ACTION_GAP = 0.5  # 每步之间停顿, 让前端反应
     def gap():
@@ -613,8 +488,7 @@ def main():
             log(f"  ⚠ 地块 {plot_no} 找不到 (跳过)"); continue
         cur = latest
         log(f"  crop={cur.get('crop','?')!r}  state={cur['state']}  "
-            f"翻地={'有' if plot_has_action(cur,'翻地') else '无'}  收获={'有' if plot_has_action(cur,'收获') else '无'}  "
-            f"道具={'有' if plot_has_action(cur,'道具') else '无'}")
+            f"翻地={'有' if plot_has_action(cur,'翻地') else '无'}  收获={'有' if plot_has_action(cur,'收获') else '无'}")
 
         # 步骤 1: 翻地 (如需要)
         if do_tilling and plot_has_action(cur, "翻地"):
@@ -627,31 +501,11 @@ def main():
             if v.get("ok"):
                 np = next((x for x in v["plots"] if x["plotNo"] == plot_no), None)
                 if np: cur = np; log(f"  [刷新] crop={cur.get('crop','?')!r}  state={cur['state']}  "
-                    f"翻地={'有' if plot_has_action(cur,'翻地') else '无'}  收获={'有' if plot_has_action(cur,'收获') else '无'}  "
-                    f"道具={'有' if plot_has_action(cur,'道具') else '无'}")
+                    f"翻地={'有' if plot_has_action(cur,'翻地') else '无'}  收获={'有' if plot_has_action(cur,'收获') else '无'}")
         else:
             log(f"  [跳过翻地] (do_tilling={do_tilling} 或地块无翻地按钮)")
 
-        # 步骤 2: 仅黑松露/玉兔萝卜/菠萝 → 道具+双倍卡 (在收获前)
-        use_card_done = False
-        if cur.get("crop") in CARD_CROPS and plot_has_action(cur, "收获"):
-            if plot_has_action(cur, "道具"):
-                gap()
-                rc = use_double_xp_card(cdp, plot_no, cur.get("crop"))
-                summary.append({"plotNo": plot_no, "action": "双倍卡", "ok": rc["ok"], "reason": rc["reason"]})
-                use_card_done = rc["ok"]
-                # 重抓, 确保收获按钮还在
-                time.sleep(0.3)
-                v = js(cdp, fetch_expr)
-                if v.get("ok"):
-                    np = next((x for x in v["plots"] if x["plotNo"] == plot_no), None)
-                    if np: cur = np
-            else:
-                log(f"  [跳过双倍卡] 地块无'道具'按钮 (可能是已用完/页面变体)")
-        else:
-            log(f"  [跳过双倍卡] crop={cur.get('crop','?')!r}, 收获按钮={'有' if plot_has_action(cur,'收获') else '无'}")
-
-        # 步骤 3: 收获 (如需要)
+        # 步骤 2: 收获 (如需要)
         if do_harvest and plot_has_action(cur, "收获"):
             gap()
             r3 = do_action(cdp, plot_no, "收获")

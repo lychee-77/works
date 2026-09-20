@@ -120,7 +120,7 @@ def parse_next_interval(captured_stdout: str) -> int:
 
 
 def parse_next_harvest_actions(captured_stdout: str, default: str = "翻地,收获") -> list:
-    """从子进程 stdout 找 'NEXT_HARVEST_ACTIONS=道具,翻地,收获', 解析成 list[str]"""
+    """从子进程 stdout 找 'NEXT_HARVEST_ACTIONS=翻地,收获', 解析成 list[str]"""
     import re
     for line in captured_stdout.splitlines():
         m = re.search(r"NEXT_HARVEST_ACTIONS\s*=\s*(.+?)(?:\s|$)", line)

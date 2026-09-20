@@ -35,11 +35,11 @@ python climbing_town.py
 ```
 
 ### 使用灵核碎片
-use_ling_ker.py: 点击背包的灵核，使用所有灵核碎片，
+use_linghe.py: 点击背包的灵核，使用所有灵核碎片，
 
 执行以下命令开启脚本：
 ```
-python use_ling_ker.py
+python use_linghe.py
 ```
 
 
